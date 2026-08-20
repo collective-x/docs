@@ -1,0 +1,1150 @@
+# openapi/v1-chat.yaml
+# x-versioning-policy: additive-minor
+#
+# Versioning policy (closes Open Question 4 from 10-RESEARCH.md):
+#   MINOR bumps (1.0 → 1.1): new optional request/response fields, new error codes
+#     added to the enum, new optional response headers.
+#   MAJOR bumps (1.x → 2.0): removed fields, changed types on existing fields, new
+#     REQUIRED request fields, new REQUIRED response fields, removed error codes.
+#
+# Hand-written YAML (not generated). Surface is tiny; static YAML is PR-reviewable
+# and beats a generator per 10-RESEARCH.md "Don't Hand-Roll" section.
+# Validated by: pnpm openapi:lint (redocly lint)
+
+openapi: 3.1.0
+
+info:
+  title: CollectiveX Health Partner API
+  version: '1.2'
+  description: |
+    The CollectiveX Health Partner API gives your product access to a grounded,
+    peer-reviewed women's-health research corpus. Every answer includes inline
+    citations from real papers; the API refuses to answer when the corpus lacks
+    strong evidence.
+
+    ---
+
+    ## API keys are server-side only
+
+    > **Warning:** Do NOT call `/v1/chat` directly from a browser. Build a
+    > server-side proxy (a Next.js Route Handler, Express middleware, or Lambda
+    > function) that forwards requests to `/v1/chat` and authenticates with the
+    > partner key from a secret manager. Browser-direct usage will leak the key
+    > to your users.
+
+    The recommended integration pattern:
+
+    ```
+    Browser  →  useChat({ api: '/api/proxy/chat' })
+                  ↓
+    Partner's server-side proxy (your Route Handler / Lambda)
+                  ↓  Authorization: Bearer $CXH_API_KEY (from env)
+    POST https://api.collectivex.health/v1/chat
+    ```
+
+    Your app owns end-user identity. We never receive end-user PII. The partner
+    key is shared across all of your end-users; you take the contract that no
+    PHI is forwarded to us in prompts.
+
+    ---
+
+    ## Authentication
+
+    All requests require an `Authorization` header:
+
+    ```
+    Authorization: Bearer <CXH_API_KEY>
+    ```
+
+    To request a key: [partners@collectivex.health](mailto:partners@collectivex.health)
+
+    ---
+
+    ## One question, one answer
+
+    Most partner integrations are single-call. The `messages` array does not
+    have to be a conversation — pass exactly one user message and treat each
+    call as an independent Q&A. The endpoint is stateless: no session, no
+    setup, no history to manage.
+
+    This is the natural fit for:
+
+    - **Snapshot insights** — daily, weekly, or on-demand recommendations
+    - **Embedded ask-widgets** — drop a research-search box on a content site
+    - **Claude Skills, MCP tools, agent tool-calls** — one call, one cited answer
+    - **Slack / Discord slash commands** — `/research <question>` → answer + sources
+    - **Background batch generation** — content calendars, email digests, alerts
+    - **Voice assistant integrations** — single utterance → single grounded answer
+
+    ```bash
+    curl -sS -X POST https://api.collectivex.health/v1/chat \
+      -H "Authorization: Bearer $CXH_API_KEY" \
+      -H "content-type: application/json" \
+      -d '{
+        "stream": false,
+        "messages": [{
+          "id": "ask-1",
+          "role": "user",
+          "parts": [{ "type": "text", "text": "What does the research say about magnesium for perimenopause sleep?" }]
+        }]
+      }'
+    ```
+
+    Because each call is independent, you can:
+
+    - **Cache by query hash** — same question, same answer, skip the call
+    - **Retry safely** — a repeated call returns a fresh grounded answer
+    - **Fan out in parallel** — fire many different questions at once (within
+      your per-key rate budget)
+
+    Need multi-turn? Chat-style follow-ups (where the next question references
+    the prior one — "is it different?", "what about HRT?") resolve correctly
+    when you include the prior `user` + `assistant` messages in the array — the
+    same shape as any AI SDK / OpenAI-style `messages` history. Only the last
+    10 messages are used.
+
+    > **Heads-up on follow-ups:** retrieval keys on the *latest* user message
+    > only. A bare follow-up like "yes please" or "tell me more" will not
+    > retrieve relevant papers on its own — keep follow-ups self-contained
+    > ("yes — show me the HRV studies") or rewrite the query on your side
+    > before sending.
+
+    ---
+
+    ## Streaming quickstart (default)
+
+    The default mode returns a streaming SSE response (AI SDK v6 UIMessage
+    protocol). This is the right choice for chat interfaces where you want to
+    show text as it streams.
+
+    ```bash
+    curl -sS -D /tmp/headers.txt \
+      -X POST https://api.collectivex.health/v1/chat \
+      -H "Authorization: Bearer $CXH_API_KEY" \
+      -H "content-type: application/json" \
+      -d '{
+        "messages": [
+          {
+            "id": "msg_smoke_1",
+            "role": "user",
+            "parts": [{ "type": "text", "text": "How does luteal-phase progesterone affect sleep?" }]
+          }
+        ]
+      }'
+    ```
+
+    Expected response:
+
+    - HTTP status `200`
+    - `content-type: text/event-stream`
+    - `x-vercel-ai-ui-message-stream: v1` header (AI SDK v6 protocol marker)
+    - SSE body with chunks: `text-delta`, `data-sources`, then `finish`
+
+    ---
+
+    ## Latency: prefer streaming wherever you can render (or buffer) it
+
+    Answers are retrieval-grounded and fully generated per request, so a
+    complete answer takes roughly **14–23 seconds** end to end (measured
+    against production on the golden question set, 2026-08-14). The two modes
+    spend that time very differently:
+
+    | mode | first byte | first answer text | complete answer |
+    |---|---|---|---|
+    | `stream` (default) | ~7s (p50) | **~9s (p50)** | ~18s (p50) |
+    | `stream: false` | ~18s (p50) — the full wait | — | ~18s (p50) |
+
+    The second half of the wall clock is the model writing the answer — time
+    streaming consumers spend reading, and sync consumers spend staring at a
+    spinner. Sync mode cannot be made materially faster server-side; switching
+    to streaming halves *perceived* latency with no server change.
+
+    Practical guidance:
+
+    - **Anything user-facing should consume the SSE stream** — first words on
+      screen at ~9s instead of a ~18s blank wait.
+    - Streaming does not require a chat UI or the AI SDK: read the
+      `text-delta` chunks and concatenate (see the proxy example below — it
+      pipes bytes through unchanged). You get the same complete answer, plus
+      progress you can surface, plus earlier timeout detection.
+    - Keep `stream: false` for consumers that structurally cannot read SSE
+      (Claude Skills, MCP tool calls, batch pipelines) — that is what it is
+      for.
+
+    ---
+
+    ## Synchronous quickstart (for Claude Skills / MCP / agents)
+
+    Send `"stream": false` to receive a flat JSON response — the right choice
+    for Claude Skills, MCP tool calls, and agent pipelines that need the full
+    answer before processing. `POST /v1/query` (below) is the same contract
+    promoted to its own named path with a question-shaped request body — both
+    are fully supported; use whichever request shape is more convenient.
+
+    ```bash
+    curl -sS \
+      -X POST https://api.collectivex.health/v1/chat \
+      -H "Authorization: Bearer $CXH_API_KEY" \
+      -H "content-type: application/json" \
+      -d '{
+        "stream": false,
+        "messages": [
+          {
+            "id": "msg_smoke_1",
+            "role": "user",
+            "parts": [{ "type": "text", "text": "How does luteal-phase progesterone affect sleep?" }]
+          }
+        ]
+      }' | jq '.'
+    ```
+
+    Expected response shape (`SyncResponse`):
+
+    ```typescript
+    interface SyncResponse {
+      request_id: string;          // UUID — use for support correlation
+      answer: string;              // empty string on deferral or crisis
+      citations: Citation[];       // empty array on deferral or crisis
+      deferral?: {
+        originalQuery: string;     // present when corpus lacks strong evidence
+      };
+      crisis?: {
+        category: 'self-harm' | 'acute-symptom' | 'ipv';
+        locale: string;
+        originalQuery: string;
+        resources: Array<{
+          region: 'US' | 'UK' | 'global';
+          name: string;
+          description: string;
+          phone?: string;
+          hours?: string;
+        }>;
+      };
+      error?: {
+        message: string;           // generic sanitized failure message (v1.1)
+      };
+    }
+    ```
+
+    ---
+
+    ## useChat via your server-side proxy
+
+    The pattern for a Next.js partner app — point `useChat` at YOUR own proxy,
+    never at `api.collectivex.health` directly:
+
+    ```tsx
+    'use client';
+    import { useChat } from '@ai-sdk/react';
+    import { DefaultChatTransport } from 'ai';
+
+    export function ResearchChat() {
+      const { messages, sendMessage } = useChat({
+        transport: new DefaultChatTransport({
+          api: '/api/proxy/chat',   // YOUR proxy — NOT api.collectivex.health
+        }),
+      });
+      // ... render
+    }
+    ```
+
+    Your server-side proxy holds the `CXH_API_KEY` and forwards to `/v1/chat`:
+
+    ```typescript
+    // app/api/proxy/chat/route.ts
+    import 'server-only';
+    export const runtime = 'nodejs';
+    export const maxDuration = 60;
+
+    export async function POST(req: Request) {
+      const CXH_API_KEY = process.env.CXH_API_KEY;
+      if (!CXH_API_KEY) return new Response('CXH_API_KEY not configured', { status: 500 });
+
+      const upstream = await fetch('https://api.collectivex.health/v1/chat', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${CXH_API_KEY}`,
+        },
+        body: await req.text(),
+      });
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: upstream.headers,
+      });
+    }
+    ```
+
+    ---
+
+    ## Rate limits
+
+    Default limits for the `standard` tier: **60 requests per minute**, **5000
+    requests per day**. Read `X-RateLimit-Remaining` on every successful response
+    to self-throttle before reaching 429. When you receive a 429, wait the number
+    of seconds in the `Retry-After` response header before retrying.
+
+    ---
+
+    ## OpenAPI spec
+
+    The machine-readable contract is at
+    [/openapi/v1-chat.yaml](/openapi/v1-chat.yaml) (the source of this
+    documentation). Drop it into Postman, Insomnia, or Stainless to generate a
+    client SDK.
+
+    ---
+
+    **Versioning policy:** Additive minor bumps for new fields/codes; breaking
+    shape changes are major.
+  contact:
+    email: partners@collectivex.health
+
+servers:
+  - url: https://api.collectivex.health
+    description: Production partner API
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/chat:
+    post:
+      operationId: postChat
+      summary: Chat with the CollectiveX Health research corpus
+      description: |
+        Dual-mode endpoint. By default (`stream` omitted or `true`) returns a streaming
+        UIMessage SSE response compatible with the Vercel AI SDK `useChat` hook. Send
+        `stream: false` to receive a synchronous JSON response (the `SyncResponse` shape)
+        suited for Claude Skills, MCP tool calls, and agent pipelines.
+
+        **Server-to-server only.** Do NOT call this endpoint from browser-side code.
+
+        Rate limits are communicated via `X-RateLimit-*` headers on every response.
+        When a 429 is returned, honour `Retry-After` before retrying.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+            examples:
+              stream_request:
+                summary: Streaming request (default)
+                value:
+                  messages:
+                    - id: msg_smoke_1
+                      role: user
+                      parts:
+                        - type: text
+                          text: How does luteal-phase progesterone affect sleep?
+              sync_request:
+                summary: Synchronous request (for Skills/agents)
+                value:
+                  stream: false
+                  messages:
+                    - id: msg_smoke_1
+                      role: user
+                      parts:
+                        - type: text
+                          text: How does luteal-phase progesterone affect sleep?
+      responses:
+        '200':
+          description: |
+            OK. Content type depends on the `stream` field in the request body:
+            - `stream: true` (default): `text/event-stream` — AI SDK v6 UIMessage SSE protocol.
+            - `stream: false`: `application/json` — SyncResponse flat envelope.
+          headers:
+            X-Request-Id:
+              description: UUID correlation key for this request (propagated to PostHog + Langfuse).
+              required: true
+              schema:
+                type: string
+                format: uuid
+                example: 550e8400-e29b-41d4-a716-446655440000
+            X-RateLimit-Limit:
+              description: Maximum requests per minute for this key.
+              required: true
+              schema:
+                type: integer
+                example: 60
+            X-RateLimit-Remaining:
+              description: Requests remaining in the current rate-limit window.
+              required: true
+              schema:
+                type: integer
+                example: 59
+            X-RateLimit-Reset:
+              description: Unix timestamp (seconds) when the rate-limit window resets.
+              required: true
+              schema:
+                type: integer
+                example: 1717000060
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  AI SDK v6 UIMessage stream protocol. The response header
+                  `x-vercel-ai-ui-message-stream: v1` is always present on streaming responses.
+
+                  Each line is a server-sent event of the form `data: <json>\n\n`.
+
+                  Partner-visible chunk types (inclusion list — all others are filtered):
+                  - `start` / `finish` / `start-step` / `finish-step`: control flow brackets
+                  - `text-start` / `text-delta` / `text-end`: streamed answer text
+                  - `data-sources`: citation array (one chunk per response)
+                  - `data-deferral`: emitted when corpus lacks strong evidence (no answer)
+                  - `data-crisis`: emitted when a safety classifier fires before retrieval
+                  - `error` / `abort`: error propagation
+
+                  See https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol for full chunk format.
+              examples:
+                grounded_stream:
+                  summary: Grounded answer stream (excerpt)
+                  value: |
+                    data: {"type":"start"}
+
+                    data: {"type":"text-start","id":"msg_abc"}
+
+                    data: {"type":"text-delta","delta":"Progesterone during the luteal phase "}
+
+                    data: {"type":"data-sources","data":[{"id":"CXH-00835","score":0.92,"text":"...","metadata":{"doi":"10.1093/humrep/dead156","year":2023}}]}
+
+                    data: {"type":"finish","finishReason":"stop"}
+                deferral_stream:
+                  summary: Deferral stream (corpus lacks evidence)
+                  value: |
+                    data: {"type":"start"}
+
+                    data: {"type":"data-deferral","data":{"originalQuery":"How do I lose weight fast?"}}
+
+                    data: {"type":"finish","finishReason":"stop"}
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncResponse'
+              examples:
+                grounded_sync:
+                  summary: Grounded synchronous response
+                  value:
+                    request_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+                    answer: Progesterone during the luteal phase has a thermogenic effect...
+                    citations:
+                      - id: CXH-00835
+                        score: 0.92
+                        text: Transdermal estradiol was associated with significant reductions...
+                        metadata:
+                          cxh_id: CXH-00835
+                          doi: 10.1093/humrep/dead156
+                          year: 2023
+                deferral_sync:
+                  summary: Deferral (corpus lacks strong evidence)
+                  value:
+                    request_id: b2c3d4e5-f6a7-8901-bcde-f12345678901
+                    answer: ''
+                    citations: []
+                    deferral:
+                      originalQuery: How do I lose weight fast?
+                crisis_sync:
+                  summary: Crisis response (safety classifier fired)
+                  value:
+                    request_id: c3d4e5f6-a7b8-9012-cdef-123456789012
+                    answer: ''
+                    citations: []
+                    crisis:
+                      category: self-harm
+                      locale: US
+                      originalQuery: I want to hurt myself
+                      resources:
+                        - region: US
+                          name: 988 Suicide & Crisis Lifeline
+                          description: 24/7 free, confidential support for people in distress.
+                          phone: '988'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: |
+            Sync mode (`stream: false`) only. The generation pipeline failed and no usable
+            content was produced (empty answer, no deferral, no crisis). The body is still
+            the SyncResponse envelope: use `request_id` for support correlation and `error.message`
+            for display. Retry with backoff. When a PARTIAL answer (or a deferral/crisis
+            short-circuit) exists alongside a pipeline error, the endpoint returns 200 with
+            the optional `error` field populated instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncResponse'
+              examples:
+                generation_failed_sync:
+                  summary: Generation failed with nothing usable
+                  value:
+                    request_id: d4e5f6a7-b8c9-0123-def1-234567890123
+                    answer: ''
+                    citations: []
+                    error:
+                      message: Generation failed. Please retry.
+        '503':
+          $ref: '#/components/responses/CorpusUnavailable'
+
+  /v1/query:
+    post:
+      operationId: postQuery
+      summary: Ask the CollectiveX Health research corpus a single question
+      description: |
+        One-shot, synchronous endpoint. Always returns `application/json` (the
+        `SyncResponse` shape) — there is no streaming mode and no `stream` field.
+        This is the recommended path for Claude Skills, MCP tool calls, agent
+        pipelines, and any caller that wants the full answer before processing —
+        the same contract as `stream: false` on `POST /v1/chat`, promoted to its
+        own named path with a question-shaped request body. Both endpoints remain
+        fully supported; there is no deprecation or migration deadline for
+        `stream: false` on `/v1/chat`.
+
+        **Server-to-server only.** Do NOT call this endpoint from browser-side code.
+
+        Internally this is the exact same pipeline as `/v1/chat` — same
+        retrieval, safety, and grounding behavior. Nothing about answer quality
+        changes based on which endpoint you call.
+
+        Rate limits are communicated via `X-RateLimit-*` headers on every
+        response and are shared with `/v1/chat` per API key (same Unkey
+        ratelimit namespace, same key). When a 429 is returned, honour
+        `Retry-After` before retrying.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+            examples:
+              single_question:
+                summary: Single question (preferred shape)
+                value:
+                  question: What does the research say about magnesium for perimenopause sleep?
+              single_element_messages:
+                summary: Single-element messages array (continuity with /v1/chat callers)
+                value:
+                  messages:
+                    - id: msg_smoke_1
+                      role: user
+                      parts:
+                        - type: text
+                          text: How does luteal-phase progesterone affect sleep?
+      responses:
+        '200':
+          description: |
+            OK. Always `application/json` — the `SyncResponse` flat envelope.
+            No `stream` negotiation; this endpoint has exactly one response shape.
+          headers:
+            X-Request-Id:
+              description: UUID correlation key for this request (propagated to PostHog + Langfuse).
+              required: true
+              schema:
+                type: string
+                format: uuid
+                example: 550e8400-e29b-41d4-a716-446655440000
+            X-RateLimit-Limit:
+              description: Maximum requests per minute for this key (shared budget with /v1/chat).
+              required: true
+              schema:
+                type: integer
+                example: 60
+            X-RateLimit-Remaining:
+              description: Requests remaining in the current rate-limit window.
+              required: true
+              schema:
+                type: integer
+                example: 59
+            X-RateLimit-Reset:
+              description: Unix timestamp (seconds) when the rate-limit window resets.
+              required: true
+              schema:
+                type: integer
+                example: 1717000060
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncResponse'
+              examples:
+                grounded_sync:
+                  summary: Grounded synchronous response
+                  value:
+                    request_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+                    answer: Progesterone during the luteal phase has a thermogenic effect...
+                    citations:
+                      - id: CXH-00835
+                        score: 0.92
+                        text: Transdermal estradiol was associated with significant reductions...
+                        metadata:
+                          cxh_id: CXH-00835
+                          doi: 10.1093/humrep/dead156
+                          year: '2023'
+                deferral_sync:
+                  summary: Deferral (corpus lacks strong evidence)
+                  value:
+                    request_id: b2c3d4e5-f6a7-8901-bcde-f12345678901
+                    answer: ''
+                    citations: []
+                    deferral:
+                      originalQuery: How do I lose weight fast?
+                crisis_sync:
+                  summary: Crisis response (safety classifier fired)
+                  value:
+                    request_id: c3d4e5f6-a7b8-9012-cdef-123456789012
+                    answer: ''
+                    citations: []
+                    crisis:
+                      category: self-harm
+                      locale: US
+                      originalQuery: I want to hurt myself
+                      resources:
+                        - region: US
+                          name: 988 Suicide & Crisis Lifeline
+                          description: 24/7 free, confidential support for people in distress.
+                          phone: '988'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: |
+            The generation pipeline failed and no usable content was produced
+            (empty answer, no deferral, no crisis). The body is still the
+            SyncResponse envelope: use `request_id` for support correlation and
+            `error.message` for display. Retry with backoff. When a PARTIAL
+            answer (or a deferral/crisis short-circuit) exists alongside a
+            pipeline error, the endpoint returns 200 with the optional `error`
+            field populated instead. Identical mapping to `/v1/chat`'s sync mode.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncResponse'
+              examples:
+                generation_failed_sync:
+                  summary: Generation failed with nothing usable
+                  value:
+                    request_id: d4e5f6a7-b8c9-0123-def1-234567890123
+                    answer: ''
+                    citations: []
+                    error:
+                      message: Generation failed. Please retry.
+        '503':
+          $ref: '#/components/responses/CorpusUnavailable'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: cxh_pk_live_*
+      description: |
+        Partner API key issued by CollectiveX Health. Contact partners@collectivex.health
+        to obtain a key. Keep it server-side only — never expose in client bundles.
+
+  schemas:
+    ChatRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Request body for POST /v1/chat. Uses additionalProperties: false (mirrors Zod .strict()
+        on the server). Any unknown field returns 400 invalid_request naming the offending field.
+        Retrieval tuning knobs (topK, rerank, rerankModel, rerankLimit, minScore, filter, mode,
+        includeRelationships) are intentionally stripped — we curate retrieval; partners don't tune.
+      required:
+        - messages
+      properties:
+        messages:
+          type: array
+          description: |
+            Conversation history as AI SDK v6 UIMessage objects. Only the last 10 messages
+            are used (matched to the internal pipeline's slice cap).
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/UIMessage'
+        stream:
+          type: boolean
+          default: true
+          description: |
+            When true (default), returns text/event-stream SSE. When false, returns
+            application/json SyncResponse. Cannot be combined with other streaming
+            negotiation headers.
+
+            Latency note: sync mode waits for the complete generation before the
+            first response byte (~18s p50 measured in production); streaming
+            delivers the first answer tokens at roughly half that (~9s p50).
+            Prefer streaming for anything user-facing — see "Latency: prefer
+            streaming" in the introduction.
+
+    QueryRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Request body for POST /v1/query. Uses additionalProperties: false (mirrors
+        Zod .strict() on the server, matching ChatRequest's convention). Exactly
+        one of `question` or `messages` is required — not both. Retrieval tuning
+        knobs are intentionally not accepted here either, for the same reason as
+        /v1/chat: we curate retrieval, partners don't tune.
+      oneOf:
+        - required: [question]
+        - required: [messages]
+      properties:
+        question:
+          type: string
+          minLength: 1
+          description: |
+            A single question, plain string. The preferred shape for /v1/query
+            callers — no message envelope needed. Internally wrapped into a
+            single-element UIMessage before being passed to the same pipeline
+            that /v1/chat uses, so behavior is identical to sending that text as
+            the sole message on /v1/chat.
+        messages:
+          type: array
+          description: |
+            Single-element AI SDK v6 UIMessage array, provided for continuity
+            with callers already building /v1/chat request bodies who want to
+            switch endpoints with a minimal diff. Unlike /v1/chat, this array
+            MUST contain exactly one message with role "user" — /v1/query has
+            no multi-turn concept. Sending more than one message, or a message
+            with a different role, is a 400 invalid_request (use /v1/chat with
+            stream:false instead if you need conversation history).
+          minItems: 1
+          maxItems: 1
+          items:
+            $ref: '#/components/schemas/UIMessage'
+
+    UIMessage:
+      type: object
+      description: AI SDK v6 UIMessage shape. id + role + parts are the load-bearing fields.
+      required:
+        - id
+        - role
+        - parts
+      properties:
+        id:
+          type: string
+          description: |
+            Unique message identifier. AI SDK clients (e.g. useChat) auto-generate
+            this; raw HTTP callers MUST provide it (any opaque string — e.g. UUID,
+            partner-side conversation row id). validateUIMessages rejects messages
+            without an id.
+        role:
+          type: string
+          enum:
+            - user
+            - assistant
+            - system
+          description: Message sender role.
+        parts:
+          type: array
+          description: |
+            Message content as an array of parts. Each part has a `type` field.
+            For user messages: use `{ "type": "text", "text": "..." }`.
+            For assistant messages: the API returns text-delta parts assembled into parts.
+          items:
+            $ref: '#/components/schemas/UIMessagePart'
+
+    UIMessagePart:
+      type: object
+      description: A single content part within a UIMessage.
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          description: 'Part type. Common values: "text", "tool-invocation", "tool-result".'
+        text:
+          type: string
+          description: Text content (present when type is "text").
+
+    SyncResponse:
+      type: object
+      description: |
+        Flat JSON envelope returned when stream=false. Always contains request_id, answer,
+        and citations. The deferral and crisis fields are mutually exclusive optional fields
+        present when the pipeline short-circuits before generating an answer.
+      required:
+        - request_id
+        - answer
+        - citations
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          description: UUID minted per request. Use for support correlation across PostHog / Langfuse / logs.
+        answer:
+          type: string
+          description: |
+            The model's answer string. Empty string ("") on deferral or crisis short-circuit
+            (the pipeline refuses to generate an answer without grounded evidence).
+        citations:
+          type: array
+          description: |
+            Retrieved citations from the peer-reviewed corpus. Empty array on deferral or crisis.
+            Never fabricate or paraphrase a citation that is not in this array.
+          items:
+            $ref: '#/components/schemas/Citation'
+        deferral:
+          description: |
+            Present when the corpus lacks strong evidence for the query. Present the originalQuery
+            back to the user and do not synthesize an answer from training data.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/DeferralPart'
+        crisis:
+          description: |
+            Present when a safety classifier fires before retrieval (self-harm, acute symptoms,
+            IPV). Show the resources verbatim and route the user away from research framing.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/CrisisPart'
+        error:
+          description: |
+            Present when the generation pipeline emitted an error (v1.1, optional). The message
+            is always a generic sanitized string — internal error details are never exposed.
+            With no usable content the response status is 502; alongside a partial answer or a
+            deferral/crisis short-circuit the status stays 200 and this field flags the failure.
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+              description: Generic human-readable failure message. Safe to display; do not parse.
+              example: Generation failed. Please retry.
+
+    Citation:
+      type: object
+      description: A single research citation from the CollectiveX Health corpus.
+      required:
+        - id
+        - score
+        - text
+      properties:
+        id:
+          type: string
+          description: Corpus-internal citation ID (e.g. "CXH-00835"). Use as an inline citation reference.
+        score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Retrieval relevance score. Higher is more relevant.
+        text:
+          type: string
+          description: Excerpt from the source paper used to ground the answer.
+        metadata:
+          type: object
+          description: |
+            Bibliographic metadata. Strict allowlist — fields not listed here are
+            stripped at the `/v1/*` boundary so partners never see Agentset-internal
+            field names. Source of truth: `lib/api/v1/citation-sanitizer.ts`
+            (`PARTNER_METADATA_ALLOWLIST`).
+          additionalProperties: false
+          properties:
+            cxh_id:
+              type: string
+              description: Canonical paper identifier in the CollectiveX Health corpus.
+              example: CXH-00835
+            doi:
+              type: string
+              description: Peer-reviewed DOI of the source paper.
+              example: 10.1093/humrep/dead156
+            year:
+              type: string
+              description: |
+                Publication year as it appears in the corpus catalog. Emitted as a
+                string at runtime (#191) — partners that want a number should
+                `parseInt(year, 10)` on the partner side. The corpus also includes
+                non-numeric values like `"in press"` for unpublished work.
+              example: '2023'
+            journal:
+              type: string
+              description: Peer-review journal name.
+              example: Human Reproduction
+            authors:
+              type: string
+              description: Author list (joined as a single string).
+              example: Shultz et al.
+            title:
+              type: string
+              description: Paper title.
+              example: 'Sex hormone profiles in normal menstruating females'
+            page_number:
+              type: integer
+              description: Page within the source paper this excerpt came from.
+              example: 4
+
+    DeferralPart:
+      type: object
+      description: |
+        Deferral payload. Indicates the corpus lacks strong evidence for this query.
+        Do not synthesize an answer from training data when this is present.
+      required:
+        - originalQuery
+      properties:
+        originalQuery:
+          type: string
+          description: The query that triggered the deferral.
+
+    CrisisPart:
+      type: object
+      description: |
+        Crisis payload. Indicates a safety classifier fired before retrieval.
+        Show the resources verbatim and route the user away from research framing.
+      required:
+        - category
+        - locale
+        - originalQuery
+        - resources
+      properties:
+        category:
+          type: string
+          enum:
+            - self-harm
+            - acute-symptom
+            - ipv
+          description: Safety category that triggered the classifier.
+        locale:
+          type: string
+          description: Detected locale (e.g. "US", "GB"). Used to select region-appropriate resources.
+          example: US
+        originalQuery:
+          type: string
+          description: The query that triggered the crisis classifier.
+        resources:
+          type: array
+          description: Crisis resources to show verbatim. Never omit or reorder.
+          items:
+            $ref: '#/components/schemas/CrisisResource'
+
+    CrisisResource:
+      type: object
+      description: |
+        A single crisis support resource. Render verbatim — do not reorder, summarise, or
+        omit fields. Source of truth: `lib/safety/crisis-resources.ts`.
+      required:
+        - region
+        - name
+        - description
+      properties:
+        region:
+          type: string
+          enum:
+            - US
+            - UK
+            - global
+          description: Region this resource applies to.
+          example: US
+        name:
+          type: string
+          description: Human-readable resource name.
+          example: '988 Suicide & Crisis Lifeline'
+        description:
+          type: string
+          description: Short context line shown next to the resource.
+          example: 24/7 free, confidential support for people in distress.
+        phone:
+          type: string
+          description: Phone or SMS contact (optional). Format varies by region.
+          example: '988'
+        hours:
+          type: string
+          description: Operating hours, when not 24/7 (optional).
+          example: 'Mon–Fri 9am–5pm ET'
+
+    ErrorEnvelope:
+      type: object
+      description: |
+        Standard partner API error envelope (D-09). Mirrors Anthropic/OpenAI error shape.
+        Parse `error.code` for machine-readable error classification.
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+            - request_id
+          properties:
+            code:
+              type: string
+              description: |
+                Machine-readable error code (D-10 locked enum). Use this for branching logic.
+                Adding new codes is a minor version bump per the versioning policy.
+              enum:
+                - unauthorized
+                - forbidden
+                - rate_limited
+                - invalid_request
+                - corpus_unavailable
+                - grounding_deferral
+                - crisis_resources
+                - internal_error
+            message:
+              type: string
+              description: Human-readable error description. Use for logging; do not parse programmatically.
+            request_id:
+              type: string
+              format: uuid
+              description: UUID for this request. Include when contacting support.
+
+  responses:
+    InvalidRequest:
+      description: |
+        400 Bad Request. The request body failed Zod .strict() validation. The error message
+        names the offending field (e.g. "Unknown field: topK"). Fix the request body.
+      headers:
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: invalid_request
+              message: 'Unknown field: topK. The /v1/chat endpoint does not accept retrieval tuning parameters.'
+              request_id: 550e8400-e29b-41d4-a716-446655440000
+
+    Unauthorized:
+      description: |
+        401 Unauthorized. Missing, malformed, or invalid API key. Check that the Authorization
+        header is present and has the form `Bearer <key>`.
+      headers:
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: unauthorized
+              message: 'Missing or malformed Authorization header. Expected: Bearer <key>'
+              request_id: 550e8400-e29b-41d4-a716-446655440000
+
+    Forbidden:
+      description: |
+        403 Forbidden. Key is valid but does not have permission for this operation.
+        Contact partners@collectivex.health.
+      headers:
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: forbidden
+              message: This key does not have permission to access /v1/chat.
+              request_id: 550e8400-e29b-41d4-a716-446655440000
+
+    RateLimited:
+      description: |
+        429 Too Many Requests. Rate limit exceeded. Read the Retry-After header (seconds)
+        before retrying. Also check X-RateLimit-Remaining on successful responses to
+        self-throttle before hitting 429.
+      headers:
+        Retry-After:
+          description: Seconds until the rate-limit window resets. Wait this long before retrying.
+          required: true
+          schema:
+            type: integer
+            example: 37
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+        X-RateLimit-Limit:
+          description: Maximum requests per minute.
+          schema:
+            type: integer
+            example: 60
+        X-RateLimit-Remaining:
+          description: Requests remaining (0 when rate-limited).
+          schema:
+            type: integer
+            example: 0
+        X-RateLimit-Reset:
+          description: Unix timestamp (seconds) when the window resets.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: rate_limited
+              message: Rate limit exceeded. Retry after 37s.
+              request_id: 550e8400-e29b-41d4-a716-446655440000
+
+    InternalError:
+      description: |
+        500 Internal Server Error. Unexpected server-side failure. Retry with exponential
+        backoff. If persistent, contact partners@collectivex.health with the request_id.
+      headers:
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: internal_error
+              message: An unexpected error occurred. Please retry.
+              request_id: 550e8400-e29b-41d4-a716-446655440000
+
+    CorpusUnavailable:
+      description: |
+        503 Service Unavailable. The research corpus (Agentset) is temporarily unavailable.
+        Retry with exponential backoff. This is a transient condition.
+      headers:
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: corpus_unavailable
+              message: Research corpus temporarily unavailable. Please retry.
+              request_id: 550e8400-e29b-41d4-a716-446655440000
