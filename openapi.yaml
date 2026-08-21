@@ -1616,7 +1616,12 @@ components:
 
     UIMessage:
       type: object
-      description: AI SDK v6 UIMessage shape. id + role + parts are the load-bearing fields.
+      description: |
+        AI SDK v6 UIMessage shape. id + role + parts are the load-bearing fields.
+        `file` parts are rejected with `400 invalid_request` on every endpoint —
+        this API's contract is text questions in, grounded text answers out, and
+        file URLs are never forwarded upstream. Text parts (and, on replayed
+        assistant history, the `data-*` parts our own stream emits) are accepted.
       required:
         - id
         - role
