@@ -445,8 +445,9 @@ info:
       extra candidates internally to compensate when the range would actually
       exclude something, so this doesn't cost you fewer results in the common
       case. A range that can't exclude any real corpus year (e.g. `{ min: 0 }`,
-      or `{ max: <a future year> }`) is a no-op and skips that extra fetch
-      entirely — it costs nothing extra AND filters nothing.
+      or `{ max: <a future year> }`) is a no-op and is skipped
+      entirely — it costs nothing extra AND filters nothing (results with a
+      missing or non-numeric recorded year come back too).
     - **`journal`** — exact-match string against the corpus's journal field, as
       recorded (case-, apostrophe-, and punctuation-sensitive). A value that
       matches nothing returns an empty result set, not an error.
@@ -757,7 +758,7 @@ paths:
                         - id: crisis-1
                           kind: crisis
                           heading: null
-                          body: "What you're describing sounds really hard. Please consider reaching out to someone who can help right now.\n\n988 Suicide & Crisis Lifeline\nCall or text: 988\n24/7 free, confidential support for people in distress.\n\nAfter you've reached out, you're welcome to continue here."
+                          body: "What you're describing sounds really hard. Please consider reaching out to someone who can help right now.\n\n988 Suicide & Crisis Lifeline  \nCall or text: 988  \n24/7 free, confidential support for people in distress.\n\nAfter you've reached out, you're welcome to continue here."
                           claims: []
                       citations: []
                       deferral: null
@@ -1043,9 +1044,10 @@ paths:
         object instead of citations, at the same 200 status those endpoints
         use. Always check for `crisis` before rendering `results`.
 
-        Results are gated by the same relevance floor `/v1/chat` and
-        `/v1/query` apply to their citations: chunks scoring below the
-        evidence threshold are dropped rather than returned. A query the
+        Results are gated by the same two-part evidence gate `/v1/chat` and
+        `/v1/query` apply to their citations: chunks below the retrieval
+        score floor are dropped, and a result set whose best re-rank score
+        falls below the topic-relevance floor is discarded entirely. A query the
         corpus has nothing relevant for returns `results: []` (see the
         `no_matches` example) — an empty array is a normal outcome, not an
         error.
@@ -1483,9 +1485,14 @@ components:
             thin part of the corpus) may return fewer results than the usual full page
             even when more matches exist further down the unfiltered ranking. A range
             that can't exclude any real corpus year (e.g. `{ min: 0 }`, or a `max` at or
-            beyond the current year) is treated as a no-op: it's still applied (harmlessly
-            — it passes everything), but does NOT trigger the extra server-side fetch,
-            since there's nothing for the extra candidates to compensate for.
+            beyond the current year) is treated as a no-op: it is skipped entirely
+            — every result comes back, including ones whose recorded year is
+            missing or non-numeric — and it does NOT trigger the extra
+            server-side fetch, since there's nothing for the extra candidates
+            to compensate for. A range that cannot possibly match (a `min`
+            beyond the current year, or a `max` before 1900) is still applied
+            (you get the honest empty result set) but also skips the extra
+            fetch.
           properties:
             min:
               type: integer
@@ -1734,6 +1741,11 @@ components:
               description: |
                 **BETA.** Present only when the request set
                 `response_format: "structured"` (see `QueryRequest.response_format`).
+                For structured-mode consumers, `structured_answer.status` is the
+                authoritative outcome — do not also branch on the legacy
+                top-level `answer`/`error` fields, which keep text-mode
+                semantics unchanged and can disagree with `status` on
+                truncated generations.
                 Absent — not null — on every request that omits it or sends
                 `response_format: "text"`, which is every request today: this field
                 is purely additive and never changes the meaning of `answer` or
