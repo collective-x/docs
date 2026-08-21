@@ -32,7 +32,7 @@ per the versioning policy.
 
 | HTTP status | `error.code` | What it means | What to do |
 |---|---|---|---|
-| 400 | `invalid_request` | Request body failed strict validation — the message names the offending field (unknown fields are rejected, e.g. `Unknown field: topK`). Also returned for an unrecognized `filters.biomarker` id on `/v1/search`, in which case the message lists every valid id. | Fix the request body. |
+| 400 | `invalid_request` | Request body failed strict validation — the message names the offending field (unknown fields are rejected, e.g. `Unknown field: topK`). | Fix the request body. |
 | 401 | `unauthorized` | Missing, malformed, or invalid API key. | Check the `Authorization` header has the form `Bearer <key>`. |
 | 403 | `forbidden` | Key is valid but lacks permission for this operation. | Contact [partners@collectivex.health](mailto:partners@collectivex.health). |
 | 429 | `rate_limited` | Rate limit exceeded. | Wait the number of seconds in `Retry-After`, then retry. |
@@ -72,8 +72,7 @@ populated instead.
 ## Rate limits
 
 Default limits for the `standard` tier: **60 requests per minute**, **5000
-requests per day** — shared across `/v1/query`, `/v1/chat`, and `/v1/search`
-per API key.
+requests per day** — shared across `/v1/query` and `/v1/chat` per API key.
 
 Every successful response carries rate-limit headers:
 

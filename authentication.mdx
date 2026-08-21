@@ -21,7 +21,7 @@ that unexpectedly.
 ## API keys are server-side only
 
 <Warning>
-Do NOT call `/v1/query`, `/v1/chat`, or `/v1/search` directly from a browser.
+Do NOT call `/v1/query` or `/v1/chat` directly from a browser.
 Build a server-side proxy (a Next.js Route Handler, Express middleware, or
 Lambda function) that forwards requests and authenticates with the partner
 key from a secret manager. Browser-direct usage will leak the key to your
@@ -35,7 +35,7 @@ Browser  →  useChat({ api: '/api/proxy/chat' })
               ↓
 Partner's server-side proxy (your Route Handler / Lambda)
               ↓  Authorization: Bearer $CXH_API_KEY (from env)
-POST https://api.collectivex.health/v1/chat  (or /v1/query, /v1/search)
+POST https://api.collectivex.health/v1/chat  (or /v1/query)
 ```
 
 Your app owns end-user identity. We never receive end-user PII. The partner
@@ -89,6 +89,6 @@ export async function POST(req: Request) {
 }
 ```
 
-The same pattern applies to `/v1/query` and `/v1/search` — the proxy pipes
+The same pattern applies to `/v1/query` — the proxy pipes
 bytes through unchanged, so streaming from `/v1/chat` works without any
 special handling.

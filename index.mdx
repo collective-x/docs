@@ -8,11 +8,11 @@ peer-reviewed women's-health research corpus. Every answer includes inline
 citations from real papers; the API refuses to answer when the corpus lacks
 strong evidence.
 
-## Three ways to use it
+## Two ways to use it
 
-There are three ways to use the API. Pick whichever matches your integration.
+There are two ways to use the API. Pick whichever matches your integration.
 
-<CardGroup cols={3}>
+<CardGroup cols={2}>
   <Card title="Ask a question" icon="circle-question" href="/quickstart">
     `POST /v1/query` — one-shot. Send a single question, get one grounded JSON
     answer back. Stateless: no session, no setup, no history to manage.
@@ -21,11 +21,12 @@ There are three ways to use the API. Pick whichever matches your integration.
     `POST /v1/chat` — multi-turn. Back-and-forth with streaming responses by
     default, or synchronous with `stream: false`.
   </Card>
-  <Card title="Search papers" icon="magnifying-glass">
-    `POST /v1/search` — retrieval only. Ranked corpus results with no
-    generated answer at all. No LLM in the loop.
-  </Card>
 </CardGroup>
+
+Full request and response schemas live in the API Reference tab, generated
+from our OpenAPI spec. The same reference is also available at
+[api.collectivex.health/docs](https://api.collectivex.health/docs), rendered
+straight from the spec.
 
 ### When to pick `/v1/query`
 
@@ -56,27 +57,10 @@ answer takes roughly **14–23 seconds** end to end. Streaming puts first words
 on screen at about 9 seconds (p50) instead of an ~18 second blank wait —
 prefer it for anything user-facing.
 
-### When to pick `/v1/search`
-
-Some integrations don't want a generated answer at all — just the ranked
-passages themselves. `/v1/search` returns retrieval results straight from the
-same curated, deduplicated corpus that grounds `/v1/chat` and `/v1/query`,
-with no synthesis and no deferral. Good for discovery widgets, custom-RAG
-partners running their own generation downstream, citation lookup, and
-cost-sensitive workflows (retrieval-only is materially cheaper since there's
-no generation step).
-
-<Warning>
-`/v1/search` still runs the same crisis classifier as `/v1/chat` and
-`/v1/query`, before retrieval. On a crisis match you get a `crisis` object
-and an empty `results` array instead of search results. Always check for
-`crisis` before rendering `results` as a normal result set.
-</Warning>
-
 ## Safety behavior, on every endpoint
 
-Two behaviors are uniform across `/v1/query`, `/v1/chat`, and `/v1/search`
-and your integration must handle both:
+Two behaviors are uniform across `/v1/query` and `/v1/chat` and your
+integration must handle both:
 
 - **Deferral** — when the corpus lacks strong evidence for a query, the API
   returns a `deferral` object instead of an answer (`answer` is an empty

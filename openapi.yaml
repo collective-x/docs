@@ -22,31 +22,30 @@ openapi: 3.1.0
 
 info:
   title: CollectiveX Health Partner API
+  # 1.7 -> 1.8: spec cleanup.
   # 1.6 -> 1.7: additive minor bump for GET /v1/jobs/{id} (async-jobs
   # skeleton) + the `not_found` error code (#818 adversarial review H5 —
   # the branch shipped both without touching this file at all). 1.6 itself
   # covers everything underneath this layer in the restacked chain
-  # (#816 /v1/search, #820 search filters, #819 structured responses,
-  # #817 per-key rate budgets).
-  version: '1.7'
+  # (#816, #820, #819 structured responses, #817 per-key rate budgets).
+  version: '1.8'
   description: |
     The CollectiveX Health Partner API gives your product access to a grounded,
     peer-reviewed women's-health research corpus. Every answer includes inline
     citations from real papers; the API refuses to answer when the corpus lacks
     strong evidence.
 
-    There are three ways to use it: ask a single question and get one
-    grounded answer (`/v1/query`), have a back-and-forth conversation with
-    streaming or sync responses (`/v1/chat`), or search the corpus directly
-    and get ranked results back with no generated answer at all (`/v1/search`),
-    plus a status endpoint for long-running jobs (`/v1/jobs/{id}` — no job
-    types are live yet). Pick whichever matches your integration below.
+    There are two ways to use it: ask a single question and get one
+    grounded answer (`/v1/query`), or have a back-and-forth conversation
+    with streaming or sync responses (`/v1/chat`), plus a status endpoint
+    for long-running jobs (`/v1/jobs/{id}` — no job types are live yet).
+    Pick whichever matches your integration below.
 
     ---
 
     ## API keys are server-side only
 
-    > **Warning:** Do NOT call `/v1/query`, `/v1/chat`, or `/v1/search`
+    > **Warning:** Do NOT call `/v1/query` or `/v1/chat`
     > directly from a browser. Build a server-side proxy (a Next.js Route
     > Handler, Express middleware, or Lambda function) that forwards requests
     > and authenticates with the partner key from a secret manager.
@@ -59,7 +58,7 @@ info:
                   ↓
     Partner's server-side proxy (your Route Handler / Lambda)
                   ↓  Authorization: Bearer $CXH_API_KEY (from env)
-    POST https://api.collectivex.health/v1/chat  (or /v1/query, /v1/search)
+    POST https://api.collectivex.health/v1/chat  (or /v1/query)
     ```
 
     Your app owns end-user identity. We never receive end-user PII. The partner
@@ -319,176 +318,11 @@ info:
 
     ---
 
-    ## Search papers — `POST /v1/search`
-
-    Some integrations don't want a generated answer at all — just the ranked
-    passages themselves. `/v1/search` returns retrieval results straight from
-    the same curated, deduplicated corpus that grounds `/v1/chat` and
-    `/v1/query`, with **no LLM in the loop**: no synthesis, no deferral. It
-    DOES run the same crisis classifier as `/v1/chat` and `/v1/query`,
-    before retrieval — the classifier is a plain regex check, not a model
-    call, so skipping it here bought nothing but a safety gap. On a crisis
-    match you get a `crisis` object and an empty `results` array instead of
-    search results; see below. You get title, score, excerpt, and
-    bibliographic metadata for each non-crisis result, and decide what to do
-    with them yourself.
-
-    **When to pick this:**
-
-    - **Discovery widgets** — "show me papers about X" result grids
-    - **Custom-RAG partners** — you want our curated, vetted corpus chunks
-      but run your own generation downstream (your voice, your prompt, your
-      model)
-    - **Citation lookup** — bibliographic metadata for `cxh_id`s referenced
-      elsewhere in your product
-    - **Cost-sensitive workflows** — retrieval-only is materially cheaper
-      than chat or query since there's no generation step
-    - **Side-by-side comparison UIs** — render results in a card grid rather
-      than a streamed answer
-
-    ```bash
-    curl -sS -X POST https://api.collectivex.health/v1/search \
-      -H "Authorization: Bearer $CXH_API_KEY" \
-      -H "content-type: application/json" \
-      -d '{
-        "query": "magnesium for perimenopause sleep"
-      }'
-    ```
-
-    **What comes back** (`SearchResponse`, abbreviated):
-
-    ```typescript
-    interface SearchResponse {
-      request_id: string;    // UUID — use for support correlation
-      query: string;         // the (trimmed) query you sent, echoed back
-      results: Citation[];   // ranked results — empty array when nothing matches
-                              // OR when `crisis` (below) is present
-      crisis?: CrisisPart;   // present only on a crisis-classifier match — see below
-    }
-    ```
-
-    ```json
-    {
-      "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-      "query": "magnesium for perimenopause sleep",
-      "results": [
-        {
-          "id": "CXH-00835",
-          "score": 0.92,
-          "text": "Transdermal estradiol was associated with significant reductions...",
-          "metadata": { "doi": "10.1093/humrep/dead156", "year": "2023" }
-        }
-      ]
-    }
-    ```
-
-    `results` uses the exact same `Citation` shape as `/v1/chat` and
-    `/v1/query` — same `id`/`score`/`text`/`metadata` fields, same metadata
-    allowlist. There's no `answer` or `deferral` field on this endpoint:
-    `/v1/search` never generates text, so those concepts don't apply. An
-    empty `results` array with no `crisis` field simply means nothing in the
-    corpus matched.
-
-    **Crisis short-circuit.** `query` runs through the exact same
-    self-harm / acute-symptom / IPV classifier `/v1/chat` and `/v1/query` run
-    before retrieval. On a match, retrieval never runs: you get `results: []`
-    and a `crisis` object — same `category`/`locale`/`originalQuery`/
-    `resources` shape as `/v1/chat` and `/v1/query`'s `crisis` field, at the
-    same `200` status — so crisis handling is uniform across every `/v1/*`
-    endpoint. Always check for `crisis` before rendering `results` as a
-    normal result set.
-
-    ```json
-    {
-      "request_id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
-      "query": "my bleeding wont stop",
-      "results": [],
-      "crisis": {
-        "category": "acute-symptom",
-        "locale": "US",
-        "originalQuery": "my bleeding wont stop",
-        "resources": [
-          {
-            "region": "US",
-            "name": "Emergency services",
-            "description": "Call 911 immediately if symptoms are severe or worsening.",
-            "phone": "911"
-          }
-        ]
-      }
-    }
-    ```
-
-    No retrieval-tuning knobs are exposed (`topK`, `rerank`, `minScore`) —
-    same posture as `/v1/query` and `/v1/chat`: we own retrieval quality so
-    results stay consistent across every partner integration. The one
-    exception is an optional `filters` object with three narrow, specific
-    filters:
-
-    ```bash
-    curl -sS -X POST https://api.collectivex.health/v1/search \
-      -H "Authorization: Bearer $CXH_API_KEY" \
-      -H "content-type: application/json" \
-      -d '{
-        "query": "estrogen and sleep quality",
-        "filters": {
-          "year": { "min": 2018 },
-          "journal": "Human Reproduction",
-          "biomarker": "bm-estrogen"
-        }
-      }'
-    ```
-
-    - **`year`** — `{ min?, max? }`, inclusive. Applied server-side after
-      retrieval (the corpus's publication-year field is inconsistently typed,
-      so an index-level range filter isn't reliable) — the server fetches
-      extra candidates internally to compensate when the range would actually
-      exclude something, so this doesn't cost you fewer results in the common
-      case. A range that can't exclude any real corpus year (e.g. `{ min: 0 }`,
-      or `{ max: <a future year> }`) is a no-op and is skipped
-      entirely — it costs nothing extra AND filters nothing (results with a
-      missing or non-numeric recorded year come back too).
-    - **`journal`** — exact-match string against the corpus's journal field, as
-      recorded (case-, apostrophe-, and punctuation-sensitive). A value that
-      matches nothing returns an empty result set, not an error.
-    - **`biomarker`** — a canonical id from CollectiveX Health's biomarker
-      vocabulary (e.g. `bm-estrogen`). The corpus doesn't tag chunks with
-      biomarkers today, so this works by enriching the retrieval query with
-      the biomarker's canonical name and synonyms rather than filtering
-      metadata — same mechanism already used internally on `/v1/chat` and
-      `/v1/query`. Unknown ids return `400 invalid_request` listing every
-      valid id. Because it never filters, it's echoed back on
-      `SearchResponse.query_expansion`, NOT `SearchResponse.filters` — see
-      below.
-
-    `year` and `journal` — the two filters that genuinely narrow the result
-    set — are echoed back on `SearchResponse.filters`, omitted entirely when
-    neither was set. `biomarker` is echoed separately on
-    `SearchResponse.query_expansion`, omitted when it wasn't set, so the
-    `filters` field never claims a filtration that didn't happen. See
-    `SearchFilters` / `SearchResponse.filters` / `SearchResponse.query_expansion`
-    in the schema reference below for the full contract, including why `year`
-    and `biomarker` work the way they do.
-
-    Not supported (yet): free-form filter expressions, and a `taxonomy`
-    filter — the corpus doesn't carry a taxonomy field on chunk metadata
-    today, so there is nothing to filter on.
-
-    **Common errors:** `400 invalid_request` (bad or unknown field in the
-    body — including an unrecognized `filters.biomarker` id, in which case
-    the error message lists every valid id), `401 unauthorized` (missing or
-    malformed key), `429 rate_limited` (back off and retry after the
-    `Retry-After` header), `503 corpus_unavailable` (the underlying search
-    index is temporarily down — retry with backoff). See "Rate limits" below
-    and the endpoint reference for the full list.
-
-    ---
-
     ## Rate limits
 
     Default limit for every key: **60 requests per minute**, shared across
     every `/v1/*` endpoint that requires a key — today that's `/v1/query`,
-    `/v1/chat`, `/v1/search`, and `/v1/jobs/{id}` — per API key. (A future endpoint on this
+    `/v1/chat`, and `/v1/jobs/{id}` — per API key. (A future endpoint on this
     same key naturally joins the same budget unless we say otherwise.)
     Limits are **per-key configurable** — some partners are provisioned with
     a different requests-per-minute ceiling, and/or a requests-per-day
@@ -541,8 +375,6 @@ tags:
     description: One-shot, single-turn — send a question, get one grounded JSON answer.
   - name: Have a conversation
     description: Multi-turn chat — streaming by default, or synchronous with stream:false.
-  - name: Search papers
-    description: Retrieval only, no LLM — send a query, get ranked corpus results back.
   - name: Async jobs
     description: |
       Poll the status of a longer-running job. Skeleton surface today —
@@ -573,7 +405,7 @@ paths:
         changes based on which endpoint you call.
 
         Rate limits are communicated via `X-RateLimit-*` headers on every
-        response and are shared with `/v1/chat` and `/v1/search` per API key
+        response and are shared with `/v1/chat` per API key
         (same rate-limit namespace, same key — see "Rate limits" above).
         When a 429 is returned, honour `Retry-After` before retrying.
       security:
@@ -617,7 +449,7 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/chat and /v1/search; per-key configurable, default 60).
+              description: Maximum requests per minute for this key (shared budget with /v1/chat; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
@@ -833,7 +665,7 @@ paths:
         **Server-to-server only.** Do NOT call this endpoint from browser-side code.
 
         Rate limits are communicated via `X-RateLimit-*` headers on every
-        response and are shared with `/v1/query` and `/v1/search` per API key
+        response and are shared with `/v1/query` per API key
         (see "Rate limits" above). When a 429 is returned, honour
         `Retry-After` before retrying.
       security:
@@ -879,7 +711,7 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/query and /v1/search; per-key configurable, default 60).
+              description: Maximum requests per minute for this key (shared budget with /v1/query; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
@@ -1028,182 +860,6 @@ paths:
         '503':
           $ref: '#/components/responses/CorpusUnavailable'
 
-  /v1/search:
-    post:
-      operationId: postSearch
-      summary: Search papers — ranked results, no generated answer
-      tags:
-        - Search papers
-      description: |
-        Retrieval-only, synchronous endpoint. Always returns `application/json`
-        (the `SearchResponse` shape) — there is no streaming mode. Calls the
-        same curated, deduplicated corpus that grounds `/v1/chat` and
-        `/v1/query`, but **runs no LLM at all**: no synthesis, no deferral.
-        It DOES run the same crisis classifier `/v1/chat` and `/v1/query` run,
-        before retrieval — on a match you get `results: []` plus a `crisis`
-        object instead of citations, at the same 200 status those endpoints
-        use. Always check for `crisis` before rendering `results`.
-
-        Results are gated by the same two-part evidence gate `/v1/chat` and
-        `/v1/query` apply to their citations: chunks below the retrieval
-        score floor are dropped, and a result set whose best re-rank score
-        falls below the topic-relevance floor is discarded entirely. A query the
-        corpus has nothing relevant for returns `results: []` (see the
-        `no_matches` example) — an empty array is a normal outcome, not an
-        error.
-
-        **Server-to-server only.** Do NOT call this endpoint from browser-side code.
-
-        Rate limits are communicated via `X-RateLimit-*` headers on every
-        response and are shared with `/v1/query` and `/v1/chat` per API key
-        (same rate-limit namespace, same key — see "Rate limits" above).
-        When a 429 is returned, honour `Retry-After` before retrying.
-      security:
-        - bearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/SearchRequest'
-            examples:
-              single_query:
-                summary: Single search query
-                value:
-                  query: magnesium for perimenopause sleep
-              filtered_query:
-                summary: Search query with filters
-                value:
-                  query: estrogen and sleep quality
-                  filters:
-                    year:
-                      min: 2018
-                    journal: Human Reproduction
-                    biomarker: bm-estrogen
-      responses:
-        '200':
-          description: |
-            OK. Always `application/json` — the `SearchResponse` flat envelope.
-            `results` may be an empty array when nothing in the corpus matches;
-            that is not an error condition.
-          headers:
-            X-Request-Id:
-              description: UUID correlation key for this request (propagated to PostHog + Langfuse).
-              required: true
-              schema:
-                type: string
-                format: uuid
-                example: 550e8400-e29b-41d4-a716-446655440000
-            X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/query and /v1/chat; per-key configurable, default 60).
-              required: true
-              schema:
-                type: integer
-                example: 60
-            X-RateLimit-Remaining:
-              description: Requests remaining in the current per-minute rate-limit window.
-              required: true
-              schema:
-                type: integer
-                example: 59
-            X-RateLimit-Reset:
-              description: Unix timestamp (seconds) when the per-minute rate-limit window resets.
-              required: true
-              schema:
-                type: integer
-                example: 1717000060
-            X-RateLimit-Limit-Daily:
-              description: Present only when this key has a configured daily (rpd) budget. Maximum requests per day.
-              required: false
-              schema:
-                type: integer
-                example: 5000
-            X-RateLimit-Remaining-Daily:
-              description: Present only when this key has a configured daily (rpd) budget. Requests remaining in the current day's window.
-              required: false
-              schema:
-                type: integer
-                example: 4321
-            X-RateLimit-Reset-Daily:
-              description: Present only when this key has a configured daily (rpd) budget. Unix timestamp (seconds) when the daily window resets.
-              required: false
-              schema:
-                type: integer
-                example: 1717003600
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SearchResponse'
-              examples:
-                ranked_results:
-                  summary: Ranked search results
-                  value:
-                    request_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-                    query: magnesium for perimenopause sleep
-                    results:
-                      - id: CXH-00835
-                        score: 0.92
-                        text: Transdermal estradiol was associated with significant reductions...
-                        metadata:
-                          cxh_id: CXH-00835
-                          doi: 10.1093/humrep/dead156
-                          year: '2023'
-                no_matches:
-                  summary: No corpus matches
-                  value:
-                    request_id: b2c3d4e5-f6a7-8901-bcde-f12345678901
-                    query: cryptocurrency portfolio strategy
-                    results: []
-                filtered_results:
-                  summary: Ranked results with filters applied/echoed, and query_expansion for biomarker
-                  value:
-                    request_id: c3d4e5f6-a7b8-9012-cdef-123456789012
-                    query: estrogen and sleep quality
-                    results:
-                      - id: CXH-00835
-                        score: 0.92
-                        text: Transdermal estradiol was associated with significant reductions...
-                        metadata:
-                          cxh_id: CXH-00835
-                          doi: 10.1093/humrep/dead156
-                          year: '2023'
-                          journal: Human Reproduction
-                    filters:
-                      year:
-                        min: 2018
-                      journal: Human Reproduction
-                    query_expansion:
-                      biomarker:
-                        id: bm-estrogen
-                        name: estrogen
-                crisis_sync:
-                  summary: Crisis response (safety classifier fired before retrieval)
-                  value:
-                    request_id: d4e5f6a7-b8c9-0123-def1-234567890124
-                    query: my bleeding wont stop
-                    results: []
-                    crisis:
-                      category: acute-symptom
-                      locale: US
-                      originalQuery: my bleeding wont stop
-                      resources:
-                        - region: US
-                          name: Emergency services
-                          description: Call 911 immediately if symptoms are severe or worsening.
-                          phone: '911'
-        '400':
-          $ref: '#/components/responses/InvalidRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '429':
-          $ref: '#/components/responses/RateLimited'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/CorpusUnavailable'
-
   /v1/jobs/{id}:
     get:
       operationId: getJob
@@ -1228,9 +884,9 @@ paths:
         endpoint never confirms another partner's job id exists.
 
         Rate limits are communicated via `X-RateLimit-*` headers on every
-        response and are shared with `/v1/query`, `/v1/chat`, and
-        `/v1/search` per API key (see "Rate limits" above). When a 429 is
-        returned, honour `Retry-After` before retrying.
+        response and are shared with `/v1/query` and `/v1/chat` per API
+        key (see "Rate limits" above). When a 429 is returned, honour
+        `Retry-After` before retrying.
       security:
         - bearerAuth: []
       parameters:
@@ -1254,7 +910,7 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/query, /v1/chat, and /v1/search; per-key configurable, default 60).
+              description: Maximum requests per minute for this key (shared budget with /v1/query and /v1/chat; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
@@ -1432,194 +1088,6 @@ components:
             unchanged `answer`/`citations` fields; nothing is removed or
             replaced. This field, and the shape it produces, may change in a
             future minor version while in beta.
-
-    SearchRequest:
-      type: object
-      additionalProperties: false
-      description: |
-        Request body for POST /v1/search. Uses additionalProperties: false (mirrors Zod
-        .strict() on the server, matching ChatRequest/QueryRequest's convention).
-        Retrieval-tuning knobs are intentionally not accepted here either, for the same
-        reason as /v1/chat and /v1/query: we curate retrieval, partners don't tune.
-        The one exception is the narrow, optional `filters` object below — three
-        specific retrieval filters, not a general tuning surface.
-      required:
-        - query
-      properties:
-        query:
-          type: string
-          minLength: 1
-          description: |
-            The search query, plain string. Whitespace is trimmed server-side before
-            retrieval and before being echoed back in the response's `query` field.
-        filters:
-          $ref: '#/components/schemas/SearchFilters'
-
-    SearchFilters:
-      type: object
-      additionalProperties: false
-      description: |
-        Optional retrieval filters. All three are independently optional; combine any
-        or none. `year` and `journal` genuinely narrow the result set, so whatever you
-        set for them is echoed back on `SearchResponse.filters` (only present when you
-        sent a `filters` object AND at least one of `year`/`journal`). `biomarker`
-        never filters — see its description below — so it's echoed separately on
-        `SearchResponse.query_expansion` instead.
-      properties:
-        year:
-          type: object
-          additionalProperties: false
-          description: |
-            Inclusive publication-year range. At least one of `min`/`max` is required
-            when `year` is present; `min` must be <= `max` when both are given.
-
-            **Implementation note:** applied AFTER retrieval, not as a native corpus
-            filter. The underlying search index's filter API is equality-only in every
-            confirmed use case in this codebase, and the corpus's `year` field is
-            inconsistently typed (numeric or string, including non-numeric values like
-            `"in press"` for unpublished work — see `Citation.metadata.year` below), so
-            a native range filter would be unreliable even if it existed. To compensate,
-            the server retrieves more candidates than usual when `year` is set AND could
-            actually exclude something. Practical effect: filtered requests cost a bit
-            more server-side work, and in rare cases (a very narrow year range against a
-            thin part of the corpus) may return fewer results than the usual full page
-            even when more matches exist further down the unfiltered ranking. A range
-            that can't exclude any real corpus year (e.g. `{ min: 0 }`, or a `max` at or
-            beyond the current year) is treated as a no-op: it is skipped entirely
-            — every result comes back, including ones whose recorded year is
-            missing or non-numeric — and it does NOT trigger the extra
-            server-side fetch, since there's nothing for the extra candidates
-            to compensate for. A range that cannot possibly match (a `min`
-            beyond the current year, or a `max` before 1900) is still applied
-            (you get the honest empty result set) but also skips the extra
-            fetch.
-          properties:
-            min:
-              type: integer
-              description: Earliest publication year to include (inclusive).
-              example: 2020
-            max:
-              type: integer
-              description: Latest publication year to include (inclusive).
-              example: 2024
-        journal:
-          type: string
-          minLength: 1
-          description: |
-            Exact-match (case-sensitive) against the corpus's `journal` metadata field.
-            Applied natively at retrieval time (no over-fetch needed) — this is a
-            straightforward equality filter, not a range query.
-
-            The value must match the journal name exactly as recorded in the corpus,
-            including casing, apostrophes, and punctuation — e.g. `PLoS ONE` and
-            `PLOS ONE` are different values. The `metadata.journal` field on returned
-            citations shows the recorded form. A value that matches nothing returns an
-            empty `results` array, not an error; papers with no recorded journal never
-            match any journal filter.
-          example: Human Reproduction
-        biomarker:
-          type: string
-          minLength: 1
-          description: |
-            A canonical biomarker id (NOT a free-text name) from CollectiveX Health's
-            biomarker vocabulary — e.g. `bm-estrogen`, `bm-hrv`. Unknown ids return `400
-            invalid_request` listing every valid id.
-
-            **Implementation note:** the corpus does not currently carry biomarker tags
-            on chunk metadata, so this cannot be a metadata filter — it never removes a
-            result from the response. Instead, the resolved biomarker's canonical name
-            and synonyms are appended to the search query before retrieval — the same
-            query-enrichment mechanism already used internally for `/v1/chat` and
-            `/v1/query` — so the ranker sees a richer signal without CollectiveX Health
-            inventing metadata that doesn't exist. The `query` field in the response is
-            always your original, un-augmented text; only the retrieval-internal query
-            changes. Because this never filters, it's echoed on
-            `SearchResponse.query_expansion`, not `SearchResponse.filters` — don't infer
-            that setting `biomarker` narrowed your results.
-          example: bm-estrogen
-
-    SearchResponse:
-      type: object
-      description: |
-        Flat JSON envelope returned by POST /v1/search. Always contains request_id, query,
-        and results. There is no `answer` or `deferral` concept on this endpoint — it never
-        runs an LLM, so it never generates or refuses to generate text. It DOES run the same
-        crisis classifier as /v1/chat and /v1/query before retrieval: on a crisis match,
-        `results` is an empty array and `crisis` is populated instead, at the same 200 status
-        those endpoints use, so crisis handling is uniform across every /v1/* endpoint.
-      required:
-        - request_id
-        - query
-        - results
-      properties:
-        request_id:
-          type: string
-          format: uuid
-          description: UUID minted per request. Use for support correlation across PostHog / Langfuse / logs.
-        query:
-          type: string
-          description: The (trimmed) query you sent, echoed back.
-        results:
-          type: array
-          description: |
-            Ranked results from the peer-reviewed corpus, same Citation shape as
-            /v1/chat and /v1/query. Empty array when nothing in the corpus matches, or
-            when the crisis classifier short-circuited the request — neither is an error
-            condition.
-          items:
-            $ref: '#/components/schemas/Citation'
-        filters:
-          description: |
-            Present ONLY when the request's `filters` object set `year` and/or
-            `journal` — echoes back what was actually applied to narrow the result
-            set. Absent when the request had no `filters` object, or when `filters`
-            only set `biomarker` (which never filters — see `query_expansion` below).
-            Never contains a `biomarker` key: that echo lives on `query_expansion`
-            instead, so this field never claims a filtration that didn't happen.
-          type: object
-          additionalProperties: false
-          properties:
-            year:
-              type: object
-              additionalProperties: false
-              properties:
-                min:
-                  type: integer
-                max:
-                  type: integer
-            journal:
-              type: string
-        query_expansion:
-          description: |
-            Present ONLY when the request's `filters.biomarker` was set and resolved
-            to a valid canonical id. Separate from `filters` because biomarker never
-            removes a result from the response — it only appends the resolved
-            canonical name + synonyms to the retrieval query text (see
-            `SearchFilters.biomarker`). The RESOLVED canonical id + name are echoed
-            (not the raw id or free text you sent — the id you sent must already be
-            canonical, but the name is looked up).
-          type: object
-          additionalProperties: false
-          properties:
-            biomarker:
-              type: object
-              additionalProperties: false
-              properties:
-                id:
-                  type: string
-                  example: bm-estrogen
-                name:
-                  type: string
-                  example: estrogen
-        crisis:
-          description: |
-            Present when the crisis classifier fires on `query` before retrieval (self-harm,
-            acute symptoms, IPV) — same classifier and same payload shape as /v1/chat and
-            /v1/query's `crisis` field. Show the resources verbatim and route the caller away
-            from a search-results UI. Absent (not present at all) on every non-crisis request.
-            Never present alongside `filters` / `query_expansion` — no filter processing
-            happens once the crisis gate fires.
-          $ref: '#/components/schemas/CrisisPart'
 
     UIMessage:
       type: object
