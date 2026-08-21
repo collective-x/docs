@@ -3,11 +3,11 @@
   "theme": "mint",
   "name": "Collective X API",
   "colors": {
-    "primary": "#0E7C7B",
-    "light": "#4FB3B0",
-    "dark": "#0A5A59"
+    "primary": "#1a3f52",
+    "light": "#6aade4",
+    "dark": "#101828"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/favicon.png",
   "navigation": {
     "tabs": [
       {
