@@ -21,7 +21,20 @@
             "group": "Getting Started",
             "pages": [
               "index",
-              "quickstart"
+              "quickstart",
+              "authentication"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "structured-answers"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "errors-and-rate-limits"
             ]
           }
         ]

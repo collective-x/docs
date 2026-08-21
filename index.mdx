@@ -1,13 +1,99 @@
 ---
-title: "Collective X API"
-description: "Grounded, cited answers from a peer-reviewed women's-health research corpus"
+title: "Overview"
+description: "Grounded answers from a peer-reviewed women's-health research corpus, with inline citations on every answer."
 ---
 
-The Collective X Partner API gives your product access to a curated, peer-reviewed
-women's-health research corpus. Every answer includes inline citations to real
-papers; the API refuses to answer when the corpus lacks strong evidence.
+The CollectiveX Health Partner API gives your product access to a grounded,
+peer-reviewed women's-health research corpus. Every answer includes inline
+citations from real papers; the API refuses to answer when the corpus lacks
+strong evidence.
 
-Head to the **API Reference** tab for the two endpoints:
+## Three ways to use it
 
-- **Ask a question** — `POST /v1/query`, one-shot JSON answer
-- **Have a conversation** — `POST /v1/chat`, streaming or sync
+There are three ways to use the API. Pick whichever matches your integration.
+
+<CardGroup cols={3}>
+  <Card title="Ask a question" icon="circle-question" href="/quickstart">
+    `POST /v1/query` — one-shot. Send a single question, get one grounded JSON
+    answer back. Stateless: no session, no setup, no history to manage.
+  </Card>
+  <Card title="Have a conversation" icon="messages">
+    `POST /v1/chat` — multi-turn. Back-and-forth with streaming responses by
+    default, or synchronous with `stream: false`.
+  </Card>
+  <Card title="Search papers" icon="magnifying-glass">
+    `POST /v1/search` — retrieval only. Ranked corpus results with no
+    generated answer at all. No LLM in the loop.
+  </Card>
+</CardGroup>
+
+### When to pick `/v1/query`
+
+Most partner integrations don't need a conversation at all — just a question
+and a grounded answer. `/v1/query` is the simplest way in: send one question,
+get back one JSON response, done.
+
+- **Snapshot insights** — daily, weekly, or on-demand recommendations
+- **Embedded ask-widgets** — drop a research-search box on a content site
+- **Claude Skills, MCP tools, agent tool-calls** — one call, one cited answer
+- **Slack / Discord slash commands** — `/research <question>` → answer + sources
+- **Background batch generation** — content calendars, email digests, alerts
+- **Voice assistant integrations** — single utterance → single grounded answer
+
+Because each call is independent, you can also cache by query hash (same
+question, same answer, skip the call), retry safely, and fan out many
+different questions in parallel within your per-key rate budget.
+
+### When to pick `/v1/chat`
+
+A chat widget, an assistant thread, or any flow with follow-ups where the
+next question references the prior one ("is it different?", "what about
+HRT?"). Streaming by default so users see text appear as it's generated;
+send `stream: false` to wait and get one JSON blob back.
+
+Answers are retrieval-grounded and fully generated per request, so a complete
+answer takes roughly **14–23 seconds** end to end. Streaming puts first words
+on screen at about 9 seconds (p50) instead of an ~18 second blank wait —
+prefer it for anything user-facing.
+
+### When to pick `/v1/search`
+
+Some integrations don't want a generated answer at all — just the ranked
+passages themselves. `/v1/search` returns retrieval results straight from the
+same curated, deduplicated corpus that grounds `/v1/chat` and `/v1/query`,
+with no synthesis and no deferral. Good for discovery widgets, custom-RAG
+partners running their own generation downstream, citation lookup, and
+cost-sensitive workflows (retrieval-only is materially cheaper since there's
+no generation step).
+
+<Warning>
+`/v1/search` still runs the same crisis classifier as `/v1/chat` and
+`/v1/query`, before retrieval. On a crisis match you get a `crisis` object
+and an empty `results` array instead of search results. Always check for
+`crisis` before rendering `results` as a normal result set.
+</Warning>
+
+## Safety behavior, on every endpoint
+
+Two behaviors are uniform across `/v1/query`, `/v1/chat`, and `/v1/search`
+and your integration must handle both:
+
+- **Deferral** — when the corpus lacks strong evidence for a query, the API
+  returns a `deferral` object instead of an answer (`answer` is an empty
+  string, `citations` an empty array). Present the `originalQuery` back to
+  the user and do not synthesize an answer from training data.
+- **Crisis** — when a safety classifier fires before retrieval (self-harm,
+  acute symptoms, IPV), the API returns a `crisis` object with
+  region-appropriate resources. Show the resources verbatim — do not reorder,
+  summarise, or omit fields — and route the user away from research framing.
+
+See [Errors and rate limits](/errors-and-rate-limits) for the error envelope,
+and [Structured answers](/structured-answers) for how these outcomes surface
+in the beta structured response format.
+
+## Get a key
+
+All requests require a partner API key. To request one, email
+[partners@collectivex.health](mailto:partners@collectivex.health). Keys are
+**server-side only** — see [Authentication](/authentication) before you write
+any client code.

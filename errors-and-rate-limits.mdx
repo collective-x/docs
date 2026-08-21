@@ -1,0 +1,95 @@
+---
+title: "Errors and rate limits"
+description: "The error envelope, every error code, and how to stay inside your rate budget."
+---
+
+## Error envelope
+
+Every non-2xx error response uses the same envelope, mirroring the
+Anthropic/OpenAI error shape. Parse `error.code` for machine-readable error
+classification; `error.message` is for logging and humans — do not parse it
+programmatically.
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "Unknown field: topK. The /v1/chat endpoint does not accept retrieval tuning parameters.",
+    "request_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+}
+```
+
+`request_id` is a UUID minted per request — include it when contacting
+support, and use it to correlate a request across your own logs. Successful
+responses carry the same id in the `X-Request-Id` response header and the
+body's `request_id` field.
+
+## Error codes
+
+The `error.code` enum is locked; adding new codes is a minor version bump
+per the versioning policy.
+
+| HTTP status | `error.code` | What it means | What to do |
+|---|---|---|---|
+| 400 | `invalid_request` | Request body failed strict validation — the message names the offending field (unknown fields are rejected, e.g. `Unknown field: topK`). Also returned for an unrecognized `filters.biomarker` id on `/v1/search`, in which case the message lists every valid id. | Fix the request body. |
+| 401 | `unauthorized` | Missing, malformed, or invalid API key. | Check the `Authorization` header has the form `Bearer <key>`. |
+| 403 | `forbidden` | Key is valid but lacks permission for this operation. | Contact [partners@collectivex.health](mailto:partners@collectivex.health). |
+| 429 | `rate_limited` | Rate limit exceeded. | Wait the number of seconds in `Retry-After`, then retry. |
+| 500 | `internal_error` | Unexpected server-side failure. | Retry with exponential backoff; if persistent, contact support with the `request_id`. |
+| 503 | `corpus_unavailable` | The research corpus is temporarily unavailable — a transient condition. | Retry with exponential backoff. |
+
+The enum also reserves `grounding_deferral` and `crisis_resources`; deferral
+and crisis outcomes are returned as `200` responses with `deferral`/`crisis`
+payloads rather than as errors — see the [Quickstart](/quickstart#handle-all-three-outcomes).
+
+## The 502 special case (sync generation failures)
+
+On `/v1/query`, and on `/v1/chat` in sync mode (`stream: false`), a
+generation-pipeline failure that produces nothing usable (empty answer, no
+deferral, no crisis) returns **502** — and the body is still the
+`SyncResponse` envelope, not the error envelope:
+
+```json
+{
+  "request_id": "d4e5f6a7-b8c9-0123-def1-234567890123",
+  "answer": "",
+  "citations": [],
+  "error": {
+    "message": "Generation failed. Please retry."
+  }
+}
+```
+
+Use `request_id` for support correlation and `error.message` for display
+(it's always a generic sanitized string — internal error details are never
+exposed). Retry with backoff.
+
+When a PARTIAL answer (or a deferral/crisis short-circuit) exists alongside a
+pipeline error, the endpoint returns **200** with the optional `error` field
+populated instead.
+
+## Rate limits
+
+Default limits for the `standard` tier: **60 requests per minute**, **5000
+requests per day** — shared across `/v1/query`, `/v1/chat`, and `/v1/search`
+per API key.
+
+Every successful response carries rate-limit headers:
+
+| Header | Meaning |
+|---|---|
+| `X-RateLimit-Limit` | Maximum requests per minute for this key. |
+| `X-RateLimit-Remaining` | Requests remaining in the current window. |
+| `X-RateLimit-Reset` | Unix timestamp (seconds) when the window resets. |
+
+Read `X-RateLimit-Remaining` on every successful response to self-throttle
+before reaching 429. When you receive a 429, wait the number of seconds in
+the `Retry-After` response header before retrying.
+
+## Versioning policy
+
+Additive minor bumps (1.0 → 1.1): new optional request/response fields, new
+error codes added to the enum, new optional response headers. Major bumps
+(1.x → 2.0): removed fields, changed types on existing fields, new required
+request or response fields, removed error codes.

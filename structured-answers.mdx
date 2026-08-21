@@ -1,0 +1,147 @@
+---
+title: "Structured answers (beta)"
+description: "Ask /v1/query for a machine-readable structured_answer alongside the normal response."
+---
+
+<Note>
+**BETA.** The `response_format` field and the shape it produces may change in
+a future minor version while in beta. `/v1/query` only — `/v1/chat` has no
+`response_format` field and can never produce `structured_answer`.
+</Note>
+
+Add `"response_format": "structured"` to a `/v1/query` request to get a
+`structured_answer` field alongside the normal `answer`/`citations` fields —
+the same answer, reshaped into sections and citation-bound claims for callers
+that want to render or route the answer programmatically instead of parsing
+markdown.
+
+This is additive only: omit the field, or set it to `"text"` (the default),
+and the response is unchanged, byte for byte. Nothing is removed or replaced,
+and `response_format` never changes which HTTP status the endpoint returns —
+only what's in the body.
+
+```bash
+curl -sS -X POST https://api.collectivex.health/v1/query \
+  -H "Authorization: Bearer $CXH_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{
+    "question": "What does the research say about magnesium for perimenopause sleep?",
+    "response_format": "structured"
+  }'
+```
+
+## Always branch on `status` first
+
+<Warning>
+**You MUST branch on `structured_answer.status` first.** It is a required
+field with one of five values — never infer the outcome from
+`sections`/`citations` being empty.
+</Warning>
+
+| `status` | Meaning |
+|---|---|
+| `answered` | A grounded answer with at least one citation. |
+| `ungrounded` | A real, non-empty answer with zero citations — kept distinct from `answered` so you can choose not to present it as evidence-backed. |
+| `deferral` | The corpus lacked strong evidence; no answer was synthesized. |
+| `crisis` | The crisis classifier short-circuited before retrieval. |
+| `error` | The pipeline emitted an error; `structured_answer.error` is populated. |
+
+A failed or truncated generation is surfaced as `status: "error"` with
+`structured_answer.error` populated and `sections`/`citations` always empty —
+it is never reshaped into a section that looks like a normal cited answer,
+even when the top-level `answer` field still carries a partial fragment for a
+text-mode caller.
+
+`deferral` and `crisis` each carry one non-empty section with pre-approved
+copy (see `StructuredSection.kind` in the schema reference) so that even a
+client that only renders `sections[].body` never shows a blank card for a
+self-harm query.
+
+## Example response
+
+```json
+{
+  "request_id": "e5f6a7b8-c9d0-1234-ef01-345678901234",
+  "answer": "Magnesium supplementation has been associated with modest improvements in sleep...",
+  "citations": [
+    {
+      "id": "CXH-00835",
+      "score": 0.92,
+      "text": "Transdermal estradiol was associated with significant reductions...",
+      "metadata": { "cxh_id": "CXH-00835", "doi": "10.1093/humrep/dead156", "year": "2023" }
+    }
+  ],
+  "structured_answer": {
+    "format": "generic",
+    "format_version": "1",
+    "schema_version": "1",
+    "status": "answered",
+    "sections": [
+      {
+        "id": "section-1",
+        "kind": "answer",
+        "heading": null,
+        "body": "Magnesium supplementation has been associated with modest improvements in sleep...",
+        "claims": [
+          {
+            "id": "claim-1",
+            "text": "Magnesium supplementation has been associated with modest improvements in sleep...",
+            "citation_ids": ["CXH-00835"]
+          }
+        ]
+      }
+    ],
+    "citations": [
+      {
+        "id": "CXH-00835",
+        "score": 0.92,
+        "text": "Transdermal estradiol was associated with significant reductions...",
+        "metadata": { "cxh_id": "CXH-00835", "doi": "10.1093/humrep/dead156", "year": "2023" }
+      }
+    ],
+    "deferral": null,
+    "crisis": null,
+    "error": null,
+    "disclaimer": {
+      "text": "Research summary, not medical advice. Consult your clinician for personal health decisions.",
+      "version": 1
+    }
+  }
+}
+```
+
+## What the fields mean
+
+- **`sections`** — the answer broken into sections. Today's pipeline emits
+  one markdown answer with no section boundaries, so a normal answer is
+  always a single-element array. Empty when `status` is `error`; exactly one
+  synthetic section when `status` is `deferral` or `crisis`.
+- **`claims`** — claims within a section, each bound to the citation ids that
+  ground it. Today this is at most one claim covering the whole section body,
+  bound to every citation returned for the answer — never a fabricated
+  sentence-level binding. A section with no supporting citations has zero
+  claims, not a claim with an empty `citation_ids`. Always empty on a
+  `crisis` or `deferral` section.
+- **`citations`** — the same citations as the top-level `citations` field,
+  through the same `Citation` schema. Empty unless `status` is `answered` or
+  `ungrounded`.
+- **`disclaimer`** — a versioned "research summary, not medical advice"
+  notice. Populated only when `status` is `answered` or `ungrounded`; `null`
+  for deferral/crisis/error, which carry their own dedicated safety framing
+  instead.
+- **`format` / `format_version` / `schema_version`** — which adapter rendered
+  this payload and its versions. `generic` is the self-service public shape.
+
+## Crisis responses in structured mode
+
+On a crisis short-circuit, `status` is `"crisis"`, the mirrored
+`structured_answer.crisis` field carries the same
+`category`/`locale`/`originalQuery`/`resources` payload as the top-level
+`crisis` field, and `sections` contains exactly one section with
+`kind: "crisis"` holding pre-approved safety copy. The same contract applies
+as everywhere else in the API: show crisis resources verbatim — do not
+reorder, summarise, or omit fields — and route the user away from research
+framing.
+
+See the full `StructuredAnswer`, `StructuredSection`, and `StructuredClaim`
+schemas in the API Reference tab.

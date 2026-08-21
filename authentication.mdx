@@ -1,0 +1,94 @@
+---
+title: "Authentication"
+description: "Bearer key auth, and why your API key must never leave your server."
+---
+
+All requests require an `Authorization` header:
+
+```
+Authorization: Bearer <CXH_API_KEY>
+```
+
+To request a key, email
+[partners@collectivex.health](mailto:partners@collectivex.health). Keys have
+the form `cxh_pk_live_*`.
+
+A missing, malformed, or invalid key returns `401 unauthorized`. A valid key
+without permission for an operation returns `403 forbidden` — contact
+[partners@collectivex.health](mailto:partners@collectivex.health) if you hit
+that unexpectedly.
+
+## API keys are server-side only
+
+<Warning>
+Do NOT call `/v1/query`, `/v1/chat`, or `/v1/search` directly from a browser.
+Build a server-side proxy (a Next.js Route Handler, Express middleware, or
+Lambda function) that forwards requests and authenticates with the partner
+key from a secret manager. Browser-direct usage will leak the key to your
+users.
+</Warning>
+
+The recommended integration pattern:
+
+```
+Browser  →  useChat({ api: '/api/proxy/chat' })
+              ↓
+Partner's server-side proxy (your Route Handler / Lambda)
+              ↓  Authorization: Bearer $CXH_API_KEY (from env)
+POST https://api.collectivex.health/v1/chat  (or /v1/query, /v1/search)
+```
+
+Your app owns end-user identity. We never receive end-user PII. The partner
+key is shared across all of your end-users; you take the contract that no
+PHI is forwarded to us in prompts.
+
+## Example proxy
+
+Point your client at YOUR own proxy, never at `api.collectivex.health`
+directly:
+
+```tsx
+'use client';
+import { useChat } from '@ai-sdk/react';
+import { DefaultChatTransport } from 'ai';
+
+export function ResearchChat() {
+  const { messages, sendMessage } = useChat({
+    transport: new DefaultChatTransport({
+      api: '/api/proxy/chat',   // YOUR proxy — NOT api.collectivex.health
+    }),
+  });
+  // ... render
+}
+```
+
+Your server-side proxy holds the `CXH_API_KEY` and forwards to `/v1/chat`:
+
+```typescript
+// app/api/proxy/chat/route.ts
+import 'server-only';
+export const runtime = 'nodejs';
+export const maxDuration = 60;
+
+export async function POST(req: Request) {
+  const CXH_API_KEY = process.env.CXH_API_KEY;
+  if (!CXH_API_KEY) return new Response('CXH_API_KEY not configured', { status: 500 });
+
+  const upstream = await fetch('https://api.collectivex.health/v1/chat', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${CXH_API_KEY}`,
+    },
+    body: await req.text(),
+  });
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
+}
+```
+
+The same pattern applies to `/v1/query` and `/v1/search` — the proxy pipes
+bytes through unchanged, so streaming from `/v1/chat` works without any
+special handling.

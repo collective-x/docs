@@ -15,22 +15,35 @@ openapi: 3.1.0
 
 info:
   title: CollectiveX Health Partner API
-  version: '1.2'
+  # 1.6 -> 1.7: additive minor bump for GET /v1/jobs/{id} (async-jobs
+  # skeleton) + the `not_found` error code (#818 adversarial review H5 —
+  # the branch shipped both without touching this file at all). 1.6 itself
+  # covers everything underneath this layer in the restacked chain
+  # (#816 /v1/search, #820 search filters, #819 structured responses,
+  # #817 per-key rate budgets).
+  version: '1.7'
   description: |
     The CollectiveX Health Partner API gives your product access to a grounded,
     peer-reviewed women's-health research corpus. Every answer includes inline
     citations from real papers; the API refuses to answer when the corpus lacks
     strong evidence.
 
+    There are three ways to use it: ask a single question and get one
+    grounded answer (`/v1/query`), have a back-and-forth conversation with
+    streaming or sync responses (`/v1/chat`), or search the corpus directly
+    and get ranked results back with no generated answer at all (`/v1/search`),
+    plus a status endpoint for long-running jobs (`/v1/jobs/{id}` — no job
+    types are live yet). Pick whichever matches your integration below.
+
     ---
 
     ## API keys are server-side only
 
-    > **Warning:** Do NOT call `/v1/chat` directly from a browser. Build a
-    > server-side proxy (a Next.js Route Handler, Express middleware, or Lambda
-    > function) that forwards requests to `/v1/chat` and authenticates with the
-    > partner key from a secret manager. Browser-direct usage will leak the key
-    > to your users.
+    > **Warning:** Do NOT call `/v1/query`, `/v1/chat`, or `/v1/search`
+    > directly from a browser. Build a server-side proxy (a Next.js Route
+    > Handler, Express middleware, or Lambda function) that forwards requests
+    > and authenticates with the partner key from a secret manager.
+    > Browser-direct usage will leak the key to your users.
 
     The recommended integration pattern:
 
@@ -39,7 +52,7 @@ info:
                   ↓
     Partner's server-side proxy (your Route Handler / Lambda)
                   ↓  Authorization: Bearer $CXH_API_KEY (from env)
-    POST https://api.collectivex.health/v1/chat
+    POST https://api.collectivex.health/v1/chat  (or /v1/query, /v1/search)
     ```
 
     Your app owns end-user identity. We never receive end-user PII. The partner
@@ -60,14 +73,14 @@ info:
 
     ---
 
-    ## One question, one answer
+    ## Ask a question — `POST /v1/query`
 
-    Most partner integrations are single-call. The `messages` array does not
-    have to be a conversation — pass exactly one user message and treat each
-    call as an independent Q&A. The endpoint is stateless: no session, no
-    setup, no history to manage.
+    Most partner integrations don't need a conversation at all — just a
+    question and a grounded answer. If that's you, `/v1/query` is the
+    simplest way in: send one question, get back one JSON response, done.
+    The endpoint is stateless — no session, no setup, no history to manage.
 
-    This is the natural fit for:
+    **When to pick this:**
 
     - **Snapshot insights** — daily, weekly, or on-demand recommendations
     - **Embedded ask-widgets** — drop a research-search box on a content site
@@ -76,46 +89,92 @@ info:
     - **Background batch generation** — content calendars, email digests, alerts
     - **Voice assistant integrations** — single utterance → single grounded answer
 
+    Because each call is independent, you can also cache by query hash (same
+    question, same answer, skip the call), retry safely (a repeated call
+    returns a fresh grounded answer), and fan out many different questions in
+    parallel within your per-key rate budget.
+
     ```bash
-    curl -sS -X POST https://api.collectivex.health/v1/chat \
+    curl -sS -X POST https://api.collectivex.health/v1/query \
       -H "Authorization: Bearer $CXH_API_KEY" \
       -H "content-type: application/json" \
       -d '{
-        "stream": false,
-        "messages": [{
-          "id": "ask-1",
-          "role": "user",
-          "parts": [{ "type": "text", "text": "What does the research say about magnesium for perimenopause sleep?" }]
-        }]
+        "question": "What does the research say about magnesium for perimenopause sleep?"
       }'
     ```
 
-    Because each call is independent, you can:
+    **What comes back** (`SyncResponse`, abbreviated):
 
-    - **Cache by query hash** — same question, same answer, skip the call
-    - **Retry safely** — a repeated call returns a fresh grounded answer
-    - **Fan out in parallel** — fire many different questions at once (within
-      your per-key rate budget)
+    ```typescript
+    interface SyncResponse {
+      request_id: string;          // UUID — use for support correlation
+      answer: string;              // empty string on deferral or crisis
+      citations: Citation[];       // empty array on deferral or crisis
+      deferral?: { originalQuery: string };  // corpus lacked strong evidence
+      crisis?: { category, locale, originalQuery, resources };  // safety classifier fired
+      error?: { message: string }; // generic sanitized failure message (v1.1)
+    }
+    ```
 
-    Need multi-turn? Chat-style follow-ups (where the next question references
-    the prior one — "is it different?", "what about HRT?") resolve correctly
-    when you include the prior `user` + `assistant` messages in the array — the
-    same shape as any AI SDK / OpenAI-style `messages` history. Only the last
-    10 messages are used.
+    ```json
+    {
+      "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "answer": "Magnesium supplementation has been associated with modest improvements in sleep quality during perimenopause...",
+      "citations": [
+        {
+          "id": "CXH-00835",
+          "score": 0.92,
+          "text": "Transdermal estradiol was associated with significant reductions...",
+          "metadata": { "doi": "10.1093/humrep/dead156", "year": "2023" }
+        }
+      ]
+    }
+    ```
 
-    > **Heads-up on follow-ups:** retrieval keys on the *latest* user message
-    > only. A bare follow-up like "yes please" or "tell me more" will not
-    > retrieve relevant papers on its own — keep follow-ups self-contained
-    > ("yes — show me the HRV studies") or rewrite the query on your side
-    > before sending.
+    Already building request bodies for `/v1/chat`? `/v1/query` also accepts
+    a single-element `messages` array in place of `question` — see the
+    endpoint reference below for the exact shape.
+
+    **Structured responses (BETA).** Add `"response_format": "structured"` to
+    get a `structured_answer` field alongside the normal `answer`/`citations`
+    fields — the same answer, reshaped into sections and citation-bound
+    claims for callers that want to render or route the answer programmatically
+    instead of parsing markdown. This is additive only: omit the field, or set
+    it to `"text"` (the default), and the response is unchanged. See
+    `QueryRequest.response_format` and `StructuredAnswer` in the schema
+    reference below. This field and its shape may change in a future minor
+    version while in beta.
+
+    **You MUST branch on `structured_answer.status` first.** It is a required
+    field with one of five values (`answered`, `ungrounded`, `deferral`,
+    `crisis`, `error`) — never infer the outcome from `sections`/`citations`
+    being empty. A failed or truncated generation is surfaced as
+    `status: "error"` with `structured_answer.error` populated and
+    `sections`/`citations` always empty — it is never reshaped into a section
+    that looks like a normal cited answer. `deferral` and `crisis` each carry
+    one non-empty section with pre-approved copy (see `StructuredSection.kind`)
+    so that even a client that only renders `sections[].body` never shows a
+    blank card for a self-harm query.
+
+    **Common errors:** `400 invalid_request` (bad or unknown field in the
+    body), `401 unauthorized` (missing or malformed key), `429 rate_limited`
+    (back off and retry after the `Retry-After` header). See "Rate limits"
+    below and the endpoint reference for the full list.
 
     ---
 
-    ## Streaming quickstart (default)
+    ## Have a conversation — `POST /v1/chat`
 
-    The default mode returns a streaming SSE response (AI SDK v6 UIMessage
-    protocol). This is the right choice for chat interfaces where you want to
-    show text as it streams.
+    When your integration needs back-and-forth — a chat UI, follow-up
+    questions, multi-turn context — use `/v1/chat` instead. It streams the
+    answer by default so users see text appear as it's generated; send
+    `stream: false` if you'd rather wait and get one JSON blob back.
+
+    **When to pick this:** a chat widget, an assistant thread, or any flow
+    with follow-ups where the next question references the prior one ("is it
+    different?", "what about HRT?").
+
+    ### Streaming (default)
 
     ```bash
     curl -sS -D /tmp/headers.txt \
@@ -133,57 +192,28 @@ info:
       }'
     ```
 
-    Expected response:
+    **What comes back:** HTTP `200`, `content-type: text/event-stream`, an
+    `x-vercel-ai-ui-message-stream: v1` header (AI SDK v6 protocol marker),
+    and an SSE body — abbreviated:
 
-    - HTTP status `200`
-    - `content-type: text/event-stream`
-    - `x-vercel-ai-ui-message-stream: v1` header (AI SDK v6 protocol marker)
-    - SSE body with chunks: `text-delta`, `data-sources`, then `finish`
+    ```
+    data: {"type":"start"}
+    data: {"type":"text-delta","delta":"Progesterone during the luteal phase "}
+    data: {"type":"data-sources","data":[{"id":"CXH-00835","score":0.92,...}]}
+    data: {"type":"finish","finishReason":"stop"}
+    ```
 
-    ---
+    ### Synchronous mode (`stream: false`)
 
-    ## Latency: prefer streaming wherever you can render (or buffer) it
-
-    Answers are retrieval-grounded and fully generated per request, so a
-    complete answer takes roughly **14–23 seconds** end to end (measured
-    against production on the golden question set, 2026-08-14). The two modes
-    spend that time very differently:
-
-    | mode | first byte | first answer text | complete answer |
-    |---|---|---|---|
-    | `stream` (default) | ~7s (p50) | **~9s (p50)** | ~18s (p50) |
-    | `stream: false` | ~18s (p50) — the full wait | — | ~18s (p50) |
-
-    The second half of the wall clock is the model writing the answer — time
-    streaming consumers spend reading, and sync consumers spend staring at a
-    spinner. Sync mode cannot be made materially faster server-side; switching
-    to streaming halves *perceived* latency with no server change.
-
-    Practical guidance:
-
-    - **Anything user-facing should consume the SSE stream** — first words on
-      screen at ~9s instead of a ~18s blank wait.
-    - Streaming does not require a chat UI or the AI SDK: read the
-      `text-delta` chunks and concatenate (see the proxy example below — it
-      pipes bytes through unchanged). You get the same complete answer, plus
-      progress you can surface, plus earlier timeout detection.
-    - Keep `stream: false` for consumers that structurally cannot read SSE
-      (Claude Skills, MCP tool calls, batch pipelines) — that is what it is
-      for.
-
-    ---
-
-    ## Synchronous quickstart (for Claude Skills / MCP / agents)
-
-    Send `"stream": false` to receive a flat JSON response — the right choice
-    for Claude Skills, MCP tool calls, and agent pipelines that need the full
-    answer before processing. `POST /v1/query` (below) is the same contract
-    promoted to its own named path with a question-shaped request body — both
-    are fully supported; use whichever request shape is more convenient.
+    Send `"stream": false` to get a flat JSON response instead of SSE — the
+    same `SyncResponse` shape shown under "Ask a question" above. This stays
+    fully supported indefinitely; it's for callers that structurally can't
+    read a stream (Claude Skills, MCP tool calls, batch pipelines). **New
+    one-shot integrations should use `/v1/query` instead** — same contract,
+    simpler request body.
 
     ```bash
-    curl -sS \
-      -X POST https://api.collectivex.health/v1/chat \
+    curl -sS -X POST https://api.collectivex.health/v1/chat \
       -H "Authorization: Bearer $CXH_API_KEY" \
       -H "content-type: application/json" \
       -d '{
@@ -198,40 +228,41 @@ info:
       }' | jq '.'
     ```
 
-    Expected response shape (`SyncResponse`):
+    ### Multi-turn follow-ups
 
-    ```typescript
-    interface SyncResponse {
-      request_id: string;          // UUID — use for support correlation
-      answer: string;              // empty string on deferral or crisis
-      citations: Citation[];       // empty array on deferral or crisis
-      deferral?: {
-        originalQuery: string;     // present when corpus lacks strong evidence
-      };
-      crisis?: {
-        category: 'self-harm' | 'acute-symptom' | 'ipv';
-        locale: string;
-        originalQuery: string;
-        resources: Array<{
-          region: 'US' | 'UK' | 'global';
-          name: string;
-          description: string;
-          phone?: string;
-          hours?: string;
-        }>;
-      };
-      error?: {
-        message: string;           // generic sanitized failure message (v1.1)
-      };
-    }
-    ```
+    Include the prior `user` + `assistant` messages in the array — the same
+    shape as any AI SDK / OpenAI-style `messages` history. Only the last 10
+    messages are used.
 
-    ---
+    > **Heads-up:** retrieval keys on the *latest* user message only. A bare
+    > follow-up like "yes please" or "tell me more" will not retrieve relevant
+    > papers on its own — keep follow-ups self-contained ("yes — show me the
+    > HRV studies") or rewrite the query on your side before sending.
 
-    ## useChat via your server-side proxy
+    ### Latency: prefer streaming wherever you can render (or buffer) it
 
-    The pattern for a Next.js partner app — point `useChat` at YOUR own proxy,
-    never at `api.collectivex.health` directly:
+    Answers are retrieval-grounded and fully generated per request, so a
+    complete answer takes roughly **14–23 seconds** end to end (measured
+    against production on the golden question set, 2026-08-14). The two modes
+    spend that time very differently:
+
+    | mode | first byte | first answer text | complete answer |
+    |---|---|---|---|
+    | `stream` (default) | ~7s (p50) | **~9s (p50)** | ~18s (p50) |
+    | `stream: false` | ~18s (p50) — the full wait | — | ~18s (p50) |
+
+    The second half of the wall clock is the model writing the answer — time
+    streaming consumers spend reading, and sync consumers spend staring at a
+    spinner. Sync mode cannot be made materially faster server-side; switching
+    to streaming halves *perceived* latency with no server change. Anything
+    user-facing should consume the SSE stream — first words on screen at ~9s
+    instead of an ~18s blank wait. Streaming doesn't require a chat UI or the
+    AI SDK either: read the `text-delta` chunks and concatenate them (the
+    proxy example below pipes bytes through unchanged).
+
+    ### Building a chat UI (`useChat` via your server-side proxy)
+
+    Point `useChat` at YOUR own proxy, never at `api.collectivex.health` directly:
 
     ```tsx
     'use client';
@@ -275,14 +306,204 @@ info:
     }
     ```
 
+    **Common errors:** same as "Ask a question" above, plus `502` in sync
+    mode when the generation pipeline fails with nothing usable (the body is
+    still a `SyncResponse` with `error.message` set — retry with backoff).
+
+    ---
+
+    ## Search papers — `POST /v1/search`
+
+    Some integrations don't want a generated answer at all — just the ranked
+    passages themselves. `/v1/search` returns retrieval results straight from
+    the same curated, deduplicated corpus that grounds `/v1/chat` and
+    `/v1/query`, with **no LLM in the loop**: no synthesis, no deferral. It
+    DOES run the same crisis classifier as `/v1/chat` and `/v1/query`,
+    before retrieval — the classifier is a plain regex check, not a model
+    call, so skipping it here bought nothing but a safety gap. On a crisis
+    match you get a `crisis` object and an empty `results` array instead of
+    search results; see below. You get title, score, excerpt, and
+    bibliographic metadata for each non-crisis result, and decide what to do
+    with them yourself.
+
+    **When to pick this:**
+
+    - **Discovery widgets** — "show me papers about X" result grids
+    - **Custom-RAG partners** — you want our curated, vetted corpus chunks
+      but run your own generation downstream (your voice, your prompt, your
+      model)
+    - **Citation lookup** — bibliographic metadata for `cxh_id`s referenced
+      elsewhere in your product
+    - **Cost-sensitive workflows** — retrieval-only is materially cheaper
+      than chat or query since there's no generation step
+    - **Side-by-side comparison UIs** — render results in a card grid rather
+      than a streamed answer
+
+    ```bash
+    curl -sS -X POST https://api.collectivex.health/v1/search \
+      -H "Authorization: Bearer $CXH_API_KEY" \
+      -H "content-type: application/json" \
+      -d '{
+        "query": "magnesium for perimenopause sleep"
+      }'
+    ```
+
+    **What comes back** (`SearchResponse`, abbreviated):
+
+    ```typescript
+    interface SearchResponse {
+      request_id: string;    // UUID — use for support correlation
+      query: string;         // the (trimmed) query you sent, echoed back
+      results: Citation[];   // ranked results — empty array when nothing matches
+                              // OR when `crisis` (below) is present
+      crisis?: CrisisPart;   // present only on a crisis-classifier match — see below
+    }
+    ```
+
+    ```json
+    {
+      "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "query": "magnesium for perimenopause sleep",
+      "results": [
+        {
+          "id": "CXH-00835",
+          "score": 0.92,
+          "text": "Transdermal estradiol was associated with significant reductions...",
+          "metadata": { "doi": "10.1093/humrep/dead156", "year": "2023" }
+        }
+      ]
+    }
+    ```
+
+    `results` uses the exact same `Citation` shape as `/v1/chat` and
+    `/v1/query` — same `id`/`score`/`text`/`metadata` fields, same metadata
+    allowlist. There's no `answer` or `deferral` field on this endpoint:
+    `/v1/search` never generates text, so those concepts don't apply. An
+    empty `results` array with no `crisis` field simply means nothing in the
+    corpus matched.
+
+    **Crisis short-circuit.** `query` runs through the exact same
+    self-harm / acute-symptom / IPV classifier `/v1/chat` and `/v1/query` run
+    before retrieval. On a match, retrieval never runs: you get `results: []`
+    and a `crisis` object — same `category`/`locale`/`originalQuery`/
+    `resources` shape as `/v1/chat` and `/v1/query`'s `crisis` field, at the
+    same `200` status — so crisis handling is uniform across every `/v1/*`
+    endpoint. Always check for `crisis` before rendering `results` as a
+    normal result set.
+
+    ```json
+    {
+      "request_id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
+      "query": "my bleeding wont stop",
+      "results": [],
+      "crisis": {
+        "category": "acute-symptom",
+        "locale": "US",
+        "originalQuery": "my bleeding wont stop",
+        "resources": [
+          {
+            "region": "US",
+            "name": "Emergency services",
+            "description": "Call 911 immediately if symptoms are severe or worsening.",
+            "phone": "911"
+          }
+        ]
+      }
+    }
+    ```
+
+    No retrieval-tuning knobs are exposed (`topK`, `rerank`, `minScore`) —
+    same posture as `/v1/query` and `/v1/chat`: we own retrieval quality so
+    results stay consistent across every partner integration. The one
+    exception is an optional `filters` object with three narrow, specific
+    filters:
+
+    ```bash
+    curl -sS -X POST https://api.collectivex.health/v1/search \
+      -H "Authorization: Bearer $CXH_API_KEY" \
+      -H "content-type: application/json" \
+      -d '{
+        "query": "estrogen and sleep quality",
+        "filters": {
+          "year": { "min": 2018 },
+          "journal": "Human Reproduction",
+          "biomarker": "bm-estrogen"
+        }
+      }'
+    ```
+
+    - **`year`** — `{ min?, max? }`, inclusive. Applied server-side after
+      retrieval (the corpus's publication-year field is inconsistently typed,
+      so an index-level range filter isn't reliable) — the server fetches
+      extra candidates internally to compensate when the range would actually
+      exclude something, so this doesn't cost you fewer results in the common
+      case. A range that can't exclude any real corpus year (e.g. `{ min: 0 }`,
+      or `{ max: <a future year> }`) is a no-op and skips that extra fetch
+      entirely — it costs nothing extra AND filters nothing.
+    - **`journal`** — exact-match string against the corpus's journal field, as
+      recorded (case-, apostrophe-, and punctuation-sensitive). A value that
+      matches nothing returns an empty result set, not an error.
+    - **`biomarker`** — a canonical id from CollectiveX Health's biomarker
+      vocabulary (e.g. `bm-estrogen`). The corpus doesn't tag chunks with
+      biomarkers today, so this works by enriching the retrieval query with
+      the biomarker's canonical name and synonyms rather than filtering
+      metadata — same mechanism already used internally on `/v1/chat` and
+      `/v1/query`. Unknown ids return `400 invalid_request` listing every
+      valid id. Because it never filters, it's echoed back on
+      `SearchResponse.query_expansion`, NOT `SearchResponse.filters` — see
+      below.
+
+    `year` and `journal` — the two filters that genuinely narrow the result
+    set — are echoed back on `SearchResponse.filters`, omitted entirely when
+    neither was set. `biomarker` is echoed separately on
+    `SearchResponse.query_expansion`, omitted when it wasn't set, so the
+    `filters` field never claims a filtration that didn't happen. See
+    `SearchFilters` / `SearchResponse.filters` / `SearchResponse.query_expansion`
+    in the schema reference below for the full contract, including why `year`
+    and `biomarker` work the way they do.
+
+    Not supported (yet): free-form filter expressions, and a `taxonomy`
+    filter — the corpus doesn't carry a taxonomy field on chunk metadata
+    today, so there is nothing to filter on.
+
+    **Common errors:** `400 invalid_request` (bad or unknown field in the
+    body — including an unrecognized `filters.biomarker` id, in which case
+    the error message lists every valid id), `401 unauthorized` (missing or
+    malformed key), `429 rate_limited` (back off and retry after the
+    `Retry-After` header), `503 corpus_unavailable` (the underlying search
+    index is temporarily down — retry with backoff). See "Rate limits" below
+    and the endpoint reference for the full list.
+
     ---
 
     ## Rate limits
 
-    Default limits for the `standard` tier: **60 requests per minute**, **5000
-    requests per day**. Read `X-RateLimit-Remaining` on every successful response
-    to self-throttle before reaching 429. When you receive a 429, wait the number
-    of seconds in the `Retry-After` response header before retrying.
+    Default limit for every key: **60 requests per minute**, shared across
+    every `/v1/*` endpoint that requires a key — today that's `/v1/query`,
+    `/v1/chat`, `/v1/search`, and `/v1/jobs/{id}` — per API key. (A future endpoint on this
+    same key naturally joins the same budget unless we say otherwise.)
+    Limits are **per-key configurable** — some partners are provisioned with
+    a different requests-per-minute ceiling, and/or a requests-per-day
+    ceiling, on request. There is no implicit daily cap unless your key has
+    been configured with one; ask partners@collectivex.health if you want a
+    daily ceiling added or changed.
+
+    Read `X-RateLimit-Remaining` on every successful response to self-throttle
+    before reaching 429. When a key has a configured daily ceiling, successful
+    responses also carry `X-RateLimit-Limit-Daily` /
+    `X-RateLimit-Remaining-Daily` / `X-RateLimit-Reset-Daily` — check these
+    too, since the per-minute headers alone can show plenty of headroom while
+    you're one request from the daily cap. When you receive a 429, wait the
+    number of seconds in the `Retry-After` response header before retrying.
+    `X-RateLimit-*` on a 429 always reflects whichever budget (per-minute or,
+    if configured, per-day) was actually exceeded.
+
+    On the rare occasion the rate-limit service itself is degraded, you'll
+    get a `503` with `error.code: "internal_error"` and a `Retry-After`
+    header — treat it like any other transient 503 and retry with backoff.
+    A genuine 429 always carries a `Retry-After` header; in a rare
+    clock-skew case its value may be `0`, which clients should treat as
+    "retry after a short backoff", not "retry immediately".
 
     ---
 
@@ -307,11 +528,294 @@ servers:
 security:
   - bearerAuth: []
 
+tags:
+  - name: Ask a question
+    description: One-shot, single-turn — send a question, get one grounded JSON answer.
+  - name: Have a conversation
+    description: Multi-turn chat — streaming by default, or synchronous with stream:false.
+  - name: Search papers
+    description: Retrieval only, no LLM — send a query, get ranked corpus results back.
+  - name: Async jobs
+    description: |
+      Poll the status of a longer-running job. Skeleton surface today —
+      only reading an existing job is exposed; nothing in this API creates
+      one yet (see the operation description below).
+
 paths:
+  /v1/query:
+    post:
+      operationId: postQuery
+      summary: Ask a question — one-shot JSON answer
+      tags:
+        - Ask a question
+      description: |
+        One-shot, synchronous endpoint. Always returns `application/json` (the
+        `SyncResponse` shape) — there is no streaming mode and no `stream` field.
+        This is the recommended path for Claude Skills, MCP tool calls, agent
+        pipelines, and any caller that wants the full answer before processing —
+        the same contract as `stream: false` on `POST /v1/chat`, promoted to its
+        own named path with a question-shaped request body. Both endpoints remain
+        fully supported; there is no deprecation or migration deadline for
+        `stream: false` on `/v1/chat`.
+
+        **Server-to-server only.** Do NOT call this endpoint from browser-side code.
+
+        Internally this is the exact same pipeline as `/v1/chat` — same
+        retrieval, safety, and grounding behavior. Nothing about answer quality
+        changes based on which endpoint you call.
+
+        Rate limits are communicated via `X-RateLimit-*` headers on every
+        response and are shared with `/v1/chat` and `/v1/search` per API key
+        (same rate-limit namespace, same key — see "Rate limits" above).
+        When a 429 is returned, honour `Retry-After` before retrying.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+            examples:
+              single_question:
+                summary: Single question (preferred shape)
+                value:
+                  question: What does the research say about magnesium for perimenopause sleep?
+              single_element_messages:
+                summary: Single-element messages array (continuity with /v1/chat callers)
+                value:
+                  messages:
+                    - id: msg_smoke_1
+                      role: user
+                      parts:
+                        - type: text
+                          text: How does luteal-phase progesterone affect sleep?
+              structured_response_format:
+                summary: 'BETA: request a structured_answer field alongside the normal response'
+                value:
+                  question: What does the research say about magnesium for perimenopause sleep?
+                  response_format: structured
+      responses:
+        '200':
+          description: |
+            OK. Always `application/json` — the `SyncResponse` flat envelope.
+            No `stream` negotiation; this endpoint has exactly one response shape.
+          headers:
+            X-Request-Id:
+              description: UUID correlation key for this request (propagated to PostHog + Langfuse).
+              required: true
+              schema:
+                type: string
+                format: uuid
+                example: 550e8400-e29b-41d4-a716-446655440000
+            X-RateLimit-Limit:
+              description: Maximum requests per minute for this key (shared budget with /v1/chat and /v1/search; per-key configurable, default 60).
+              required: true
+              schema:
+                type: integer
+                example: 60
+            X-RateLimit-Remaining:
+              description: Requests remaining in the current per-minute rate-limit window.
+              required: true
+              schema:
+                type: integer
+                example: 59
+            X-RateLimit-Reset:
+              description: Unix timestamp (seconds) when the per-minute rate-limit window resets.
+              required: true
+              schema:
+                type: integer
+                example: 1717000060
+            X-RateLimit-Limit-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Maximum requests per day.
+              required: false
+              schema:
+                type: integer
+                example: 5000
+            X-RateLimit-Remaining-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Requests remaining in the current day's window.
+              required: false
+              schema:
+                type: integer
+                example: 4321
+            X-RateLimit-Reset-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Unix timestamp (seconds) when the daily window resets.
+              required: false
+              schema:
+                type: integer
+                example: 1717003600
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+              examples:
+                grounded_sync:
+                  summary: Grounded synchronous response
+                  value:
+                    request_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+                    answer: Progesterone during the luteal phase has a thermogenic effect...
+                    citations:
+                      - id: CXH-00835
+                        score: 0.92
+                        text: Transdermal estradiol was associated with significant reductions...
+                        metadata:
+                          cxh_id: CXH-00835
+                          doi: 10.1093/humrep/dead156
+                          year: '2023'
+                deferral_sync:
+                  summary: Deferral (corpus lacks strong evidence)
+                  value:
+                    request_id: b2c3d4e5-f6a7-8901-bcde-f12345678901
+                    answer: ''
+                    citations: []
+                    deferral:
+                      originalQuery: How do I lose weight fast?
+                crisis_sync:
+                  summary: Crisis response (safety classifier fired)
+                  value:
+                    request_id: c3d4e5f6-a7b8-9012-cdef-123456789012
+                    answer: ''
+                    citations: []
+                    crisis:
+                      category: self-harm
+                      locale: US
+                      originalQuery: I want to hurt myself
+                      resources:
+                        - region: US
+                          name: 988 Suicide & Crisis Lifeline
+                          description: 24/7 free, confidential support for people in distress.
+                          phone: '988'
+                structured_sync:
+                  summary: 'BETA: response_format: "structured" — same answer, plus structured_answer'
+                  value:
+                    request_id: e5f6a7b8-c9d0-1234-ef01-345678901234
+                    answer: Magnesium supplementation has been associated with modest improvements in sleep...
+                    citations:
+                      - id: CXH-00835
+                        score: 0.92
+                        text: Transdermal estradiol was associated with significant reductions...
+                        metadata:
+                          cxh_id: CXH-00835
+                          doi: 10.1093/humrep/dead156
+                          year: '2023'
+                    structured_answer:
+                      format: generic
+                      format_version: '1'
+                      schema_version: '1'
+                      status: answered
+                      sections:
+                        - id: section-1
+                          kind: answer
+                          heading: null
+                          body: Magnesium supplementation has been associated with modest improvements in sleep...
+                          claims:
+                            - id: claim-1
+                              text: Magnesium supplementation has been associated with modest improvements in sleep...
+                              citation_ids: [CXH-00835]
+                      citations:
+                        - id: CXH-00835
+                          score: 0.92
+                          text: Transdermal estradiol was associated with significant reductions...
+                          metadata:
+                            cxh_id: CXH-00835
+                            doi: 10.1093/humrep/dead156
+                            year: '2023'
+                      deferral: null
+                      crisis: null
+                      error: null
+                      disclaimer:
+                        text: Research summary, not medical advice. Consult your clinician for personal health decisions.
+                        version: 1
+                structured_crisis_sync:
+                  summary: 'BETA: response_format: "structured" on a crisis short-circuit — status "crisis", a non-empty synthetic section'
+                  value:
+                    request_id: f6a7b8c9-d0e1-2345-f012-456789012345
+                    answer: ''
+                    citations: []
+                    crisis:
+                      category: self-harm
+                      locale: US
+                      originalQuery: I want to hurt myself
+                      resources:
+                        - region: US
+                          name: 988 Suicide & Crisis Lifeline
+                          description: 24/7 free, confidential support for people in distress.
+                          phone: '988'
+                    structured_answer:
+                      format: generic
+                      format_version: '1'
+                      schema_version: '1'
+                      status: crisis
+                      sections:
+                        - id: crisis-1
+                          kind: crisis
+                          heading: null
+                          body: "What you're describing sounds really hard. Please consider reaching out to someone who can help right now.\n\n988 Suicide & Crisis Lifeline\nCall or text: 988\n24/7 free, confidential support for people in distress.\n\nAfter you've reached out, you're welcome to continue here."
+                          claims: []
+                      citations: []
+                      deferral: null
+                      crisis:
+                        category: self-harm
+                        locale: US
+                        originalQuery: I want to hurt myself
+                        resources:
+                          - region: US
+                            name: 988 Suicide & Crisis Lifeline
+                            description: 24/7 free, confidential support for people in distress.
+                            phone: '988'
+                      error: null
+                      disclaimer: null
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: |
+            The generation pipeline failed and no usable content was produced
+            (empty answer, no deferral, no crisis). The body is still the
+            SyncResponse envelope: use `request_id` for support correlation and
+            `error.message` for display. Retry with backoff. When a PARTIAL
+            answer (or a deferral/crisis short-circuit) exists alongside a
+            pipeline error, the endpoint returns 200 with the optional `error`
+            field populated instead. Identical mapping to `/v1/chat`'s sync mode.
+
+            **`response_format: "structured"` gets the exact same status code
+            for the exact same envelope** — `response_format` never changes
+            which status this endpoint returns, only what's in the body. When
+            it does, `structured_answer.status` is `"error"` and
+            `structured_answer.error` carries the same message as the
+            top-level `error` field; `structured_answer.sections`/`citations`
+            are always empty in this state, even when a partial `answer` is
+            present in the same body — a truncated generation is never
+            reshaped into a claim that looks grounded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+              examples:
+                generation_failed_sync:
+                  summary: Generation failed with nothing usable
+                  value:
+                    request_id: d4e5f6a7-b8c9-0123-def1-234567890123
+                    answer: ''
+                    citations: []
+                    error:
+                      message: Generation failed. Please retry.
+        '503':
+          $ref: '#/components/responses/CorpusUnavailable'
+
   /v1/chat:
     post:
       operationId: postChat
-      summary: Chat with the CollectiveX Health research corpus
+      summary: Have a conversation — streaming or sync
+      tags:
+        - Have a conversation
       description: |
         Dual-mode endpoint. By default (`stream` omitted or `true`) returns a streaming
         UIMessage SSE response compatible with the Vercel AI SDK `useChat` hook. Send
@@ -320,8 +824,10 @@ paths:
 
         **Server-to-server only.** Do NOT call this endpoint from browser-side code.
 
-        Rate limits are communicated via `X-RateLimit-*` headers on every response.
-        When a 429 is returned, honour `Retry-After` before retrying.
+        Rate limits are communicated via `X-RateLimit-*` headers on every
+        response and are shared with `/v1/query` and `/v1/search` per API key
+        (see "Rate limits" above). When a 429 is returned, honour
+        `Retry-After` before retrying.
       security:
         - bearerAuth: []
       requestBody:
@@ -365,23 +871,41 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key.
+              description: Maximum requests per minute for this key (shared budget with /v1/query and /v1/search; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
                 example: 60
             X-RateLimit-Remaining:
-              description: Requests remaining in the current rate-limit window.
+              description: Requests remaining in the current per-minute rate-limit window.
               required: true
               schema:
                 type: integer
                 example: 59
             X-RateLimit-Reset:
-              description: Unix timestamp (seconds) when the rate-limit window resets.
+              description: Unix timestamp (seconds) when the per-minute rate-limit window resets.
               required: true
               schema:
                 type: integer
                 example: 1717000060
+            X-RateLimit-Limit-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Maximum requests per day.
+              required: false
+              schema:
+                type: integer
+                example: 5000
+            X-RateLimit-Remaining-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Requests remaining in the current day's window.
+              required: false
+              schema:
+                type: integer
+                example: 4321
+            X-RateLimit-Reset-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Unix timestamp (seconds) when the daily window resets.
+              required: false
+              schema:
+                type: integer
+                example: 1717003600
           content:
             text/event-stream:
               schema:
@@ -496,30 +1020,35 @@ paths:
         '503':
           $ref: '#/components/responses/CorpusUnavailable'
 
-  /v1/query:
+  /v1/search:
     post:
-      operationId: postQuery
-      summary: Ask the CollectiveX Health research corpus a single question
+      operationId: postSearch
+      summary: Search papers — ranked results, no generated answer
+      tags:
+        - Search papers
       description: |
-        One-shot, synchronous endpoint. Always returns `application/json` (the
-        `SyncResponse` shape) — there is no streaming mode and no `stream` field.
-        This is the recommended path for Claude Skills, MCP tool calls, agent
-        pipelines, and any caller that wants the full answer before processing —
-        the same contract as `stream: false` on `POST /v1/chat`, promoted to its
-        own named path with a question-shaped request body. Both endpoints remain
-        fully supported; there is no deprecation or migration deadline for
-        `stream: false` on `/v1/chat`.
+        Retrieval-only, synchronous endpoint. Always returns `application/json`
+        (the `SearchResponse` shape) — there is no streaming mode. Calls the
+        same curated, deduplicated corpus that grounds `/v1/chat` and
+        `/v1/query`, but **runs no LLM at all**: no synthesis, no deferral.
+        It DOES run the same crisis classifier `/v1/chat` and `/v1/query` run,
+        before retrieval — on a match you get `results: []` plus a `crisis`
+        object instead of citations, at the same 200 status those endpoints
+        use. Always check for `crisis` before rendering `results`.
+
+        Results are gated by the same relevance floor `/v1/chat` and
+        `/v1/query` apply to their citations: chunks scoring below the
+        evidence threshold are dropped rather than returned. A query the
+        corpus has nothing relevant for returns `results: []` (see the
+        `no_matches` example) — an empty array is a normal outcome, not an
+        error.
 
         **Server-to-server only.** Do NOT call this endpoint from browser-side code.
 
-        Internally this is the exact same pipeline as `/v1/chat` — same
-        retrieval, safety, and grounding behavior. Nothing about answer quality
-        changes based on which endpoint you call.
-
         Rate limits are communicated via `X-RateLimit-*` headers on every
-        response and are shared with `/v1/chat` per API key (same Unkey
-        ratelimit namespace, same key). When a 429 is returned, honour
-        `Retry-After` before retrying.
+        response and are shared with `/v1/query` and `/v1/chat` per API key
+        (same rate-limit namespace, same key — see "Rate limits" above).
+        When a 429 is returned, honour `Retry-After` before retrying.
       security:
         - bearerAuth: []
       requestBody:
@@ -527,26 +1056,27 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/QueryRequest'
+              $ref: '#/components/schemas/SearchRequest'
             examples:
-              single_question:
-                summary: Single question (preferred shape)
+              single_query:
+                summary: Single search query
                 value:
-                  question: What does the research say about magnesium for perimenopause sleep?
-              single_element_messages:
-                summary: Single-element messages array (continuity with /v1/chat callers)
+                  query: magnesium for perimenopause sleep
+              filtered_query:
+                summary: Search query with filters
                 value:
-                  messages:
-                    - id: msg_smoke_1
-                      role: user
-                      parts:
-                        - type: text
-                          text: How does luteal-phase progesterone affect sleep?
+                  query: estrogen and sleep quality
+                  filters:
+                    year:
+                      min: 2018
+                    journal: Human Reproduction
+                    biomarker: bm-estrogen
       responses:
         '200':
           description: |
-            OK. Always `application/json` — the `SyncResponse` flat envelope.
-            No `stream` negotiation; this endpoint has exactly one response shape.
+            OK. Always `application/json` — the `SearchResponse` flat envelope.
+            `results` may be an empty array when nothing in the corpus matches;
+            that is not an error condition.
           headers:
             X-Request-Id:
               description: UUID correlation key for this request (propagated to PostHog + Langfuse).
@@ -556,34 +1086,52 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/chat).
+              description: Maximum requests per minute for this key (shared budget with /v1/query and /v1/chat; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
                 example: 60
             X-RateLimit-Remaining:
-              description: Requests remaining in the current rate-limit window.
+              description: Requests remaining in the current per-minute rate-limit window.
               required: true
               schema:
                 type: integer
                 example: 59
             X-RateLimit-Reset:
-              description: Unix timestamp (seconds) when the rate-limit window resets.
+              description: Unix timestamp (seconds) when the per-minute rate-limit window resets.
               required: true
               schema:
                 type: integer
                 example: 1717000060
+            X-RateLimit-Limit-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Maximum requests per day.
+              required: false
+              schema:
+                type: integer
+                example: 5000
+            X-RateLimit-Remaining-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Requests remaining in the current day's window.
+              required: false
+              schema:
+                type: integer
+                example: 4321
+            X-RateLimit-Reset-Daily:
+              description: Present only when this key has a configured daily (rpd) budget. Unix timestamp (seconds) when the daily window resets.
+              required: false
+              schema:
+                type: integer
+                example: 1717003600
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SyncResponse'
+                $ref: '#/components/schemas/SearchResponse'
               examples:
-                grounded_sync:
-                  summary: Grounded synchronous response
+                ranked_results:
+                  summary: Ranked search results
                   value:
                     request_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-                    answer: Progesterone during the luteal phase has a thermogenic effect...
-                    citations:
+                    query: magnesium for perimenopause sleep
+                    results:
                       - id: CXH-00835
                         score: 0.92
                         text: Transdermal estradiol was associated with significant reductions...
@@ -591,29 +1139,49 @@ paths:
                           cxh_id: CXH-00835
                           doi: 10.1093/humrep/dead156
                           year: '2023'
-                deferral_sync:
-                  summary: Deferral (corpus lacks strong evidence)
+                no_matches:
+                  summary: No corpus matches
                   value:
                     request_id: b2c3d4e5-f6a7-8901-bcde-f12345678901
-                    answer: ''
-                    citations: []
-                    deferral:
-                      originalQuery: How do I lose weight fast?
-                crisis_sync:
-                  summary: Crisis response (safety classifier fired)
+                    query: cryptocurrency portfolio strategy
+                    results: []
+                filtered_results:
+                  summary: Ranked results with filters applied/echoed, and query_expansion for biomarker
                   value:
                     request_id: c3d4e5f6-a7b8-9012-cdef-123456789012
-                    answer: ''
-                    citations: []
+                    query: estrogen and sleep quality
+                    results:
+                      - id: CXH-00835
+                        score: 0.92
+                        text: Transdermal estradiol was associated with significant reductions...
+                        metadata:
+                          cxh_id: CXH-00835
+                          doi: 10.1093/humrep/dead156
+                          year: '2023'
+                          journal: Human Reproduction
+                    filters:
+                      year:
+                        min: 2018
+                      journal: Human Reproduction
+                    query_expansion:
+                      biomarker:
+                        id: bm-estrogen
+                        name: estrogen
+                crisis_sync:
+                  summary: Crisis response (safety classifier fired before retrieval)
+                  value:
+                    request_id: d4e5f6a7-b8c9-0123-def1-234567890124
+                    query: my bleeding wont stop
+                    results: []
                     crisis:
-                      category: self-harm
+                      category: acute-symptom
                       locale: US
-                      originalQuery: I want to hurt myself
+                      originalQuery: my bleeding wont stop
                       resources:
                         - region: US
-                          name: 988 Suicide & Crisis Lifeline
-                          description: 24/7 free, confidential support for people in distress.
-                          phone: '988'
+                          name: Emergency services
+                          description: Call 911 immediately if symptoms are severe or worsening.
+                          phone: '911'
         '400':
           $ref: '#/components/responses/InvalidRequest'
         '401':
@@ -624,30 +1192,142 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/InternalError'
-        '502':
-          description: |
-            The generation pipeline failed and no usable content was produced
-            (empty answer, no deferral, no crisis). The body is still the
-            SyncResponse envelope: use `request_id` for support correlation and
-            `error.message` for display. Retry with backoff. When a PARTIAL
-            answer (or a deferral/crisis short-circuit) exists alongside a
-            pipeline error, the endpoint returns 200 with the optional `error`
-            field populated instead. Identical mapping to `/v1/chat`'s sync mode.
+        '503':
+          $ref: '#/components/responses/CorpusUnavailable'
+
+  /v1/jobs/{id}:
+    get:
+      operationId: getJob
+      summary: Poll an async job's status
+      tags:
+        - Async jobs
+      description: |
+        Read-only poll for one async job's current state. This is a
+        **skeleton surface**: nothing in this API creates a job yet —
+        there is no `POST /v1/jobs`. Job rows are written by internal
+        processes today; job types ship one at a time, each behind its
+        own validated shape, in a later release. This endpoint exists so
+        that work can land ahead of the first job type without a
+        breaking spec change later.
+
+        **Server-to-server only.** Do NOT call this endpoint from
+        browser-side code.
+
+        Scoping: a job is visible only to the API key that owns it. A
+        job id that doesn't exist and a job id that belongs to a
+        different key both return the identical `404 not_found` — this
+        endpoint never confirms another partner's job id exists.
+
+        Rate limits are communicated via `X-RateLimit-*` headers on every
+        response and are shared with `/v1/query`, `/v1/chat`, and
+        `/v1/search` per API key (see "Rate limits" above). When a 429 is
+        returned, honour `Retry-After` before retrying.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The job's id, as returned when it was created.
+          schema:
+            type: string
+            format: uuid
+          example: 8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
+      responses:
+        '200':
+          description: OK. The job's current state.
+          headers:
+            X-Request-Id:
+              description: UUID correlation key for this request.
+              required: true
+              schema:
+                type: string
+                format: uuid
+                example: 550e8400-e29b-41d4-a716-446655440000
+            X-RateLimit-Limit:
+              description: Maximum requests per minute for this key (shared budget with /v1/query, /v1/chat, and /v1/search; per-key configurable, default 60).
+              required: true
+              schema:
+                type: integer
+                example: 60
+            X-RateLimit-Remaining:
+              description: Requests remaining in the current per-minute rate-limit window.
+              required: true
+              schema:
+                type: integer
+                example: 59
+            X-RateLimit-Reset:
+              description: Unix timestamp (seconds) when the per-minute rate-limit window resets.
+              required: true
+              schema:
+                type: integer
+                example: 1717000060
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SyncResponse'
+                $ref: '#/components/schemas/JobResponse'
               examples:
-                generation_failed_sync:
-                  summary: Generation failed with nothing usable
+                succeeded_job:
+                  summary: Completed job
                   value:
-                    request_id: d4e5f6a7-b8c9-0123-def1-234567890123
-                    answer: ''
-                    citations: []
-                    error:
-                      message: Generation failed. Please retry.
+                    request_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+                    id: 8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
+                    job_type: lab_panel_interpretation
+                    status: succeeded
+                    payload:
+                      panelId: p1
+                    result:
+                      score: 1
+                    error: null
+                    expires_at: null
+                    created_at: '2026-08-19T00:00:00.000Z'
+                    updated_at: '2026-08-19T00:05:00.000Z'
+                running_job:
+                  summary: Still in progress
+                  value:
+                    request_id: b2c3d4e5-f6a7-8901-bcde-f12345678901
+                    id: 8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
+                    job_type: lab_panel_interpretation
+                    status: running
+                    payload: {}
+                    result: null
+                    error: null
+                    expires_at: null
+                    created_at: '2026-08-19T00:00:00.000Z'
+                    updated_at: '2026-08-19T00:00:01.000Z'
+        '400':
+          description: |
+            400 Bad Request. `id` is not a valid UUID. `partner_jobs.id`
+            is a `uuid` database column, so a malformed id is rejected
+            before any query runs.
+          headers:
+            X-Request-Id:
+              description: Request UUID.
+              schema:
+                type: string
+                format: uuid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: invalid_request
+                  message: Invalid job id. Expected a UUID.
+                  request_id: 550e8400-e29b-41d4-a716-446655440000
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
         '503':
           $ref: '#/components/responses/CorpusUnavailable'
+
 
 components:
   securitySchemes:
@@ -729,6 +1409,203 @@ components:
           maxItems: 1
           items:
             $ref: '#/components/schemas/UIMessage'
+        response_format:
+          type: string
+          enum:
+            - text
+            - structured
+          default: text
+          description: |
+            **BETA.** When omitted or `"text"`, the response is byte-for-byte
+            the `SyncResponse` this endpoint has always returned — no behavior
+            change. When `"structured"`, the response ADDS a `structured_answer`
+            field (machine-readable sections/claims/citations) alongside the
+            unchanged `answer`/`citations` fields; nothing is removed or
+            replaced. This field, and the shape it produces, may change in a
+            future minor version while in beta.
+
+    SearchRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Request body for POST /v1/search. Uses additionalProperties: false (mirrors Zod
+        .strict() on the server, matching ChatRequest/QueryRequest's convention).
+        Retrieval-tuning knobs are intentionally not accepted here either, for the same
+        reason as /v1/chat and /v1/query: we curate retrieval, partners don't tune.
+        The one exception is the narrow, optional `filters` object below — three
+        specific retrieval filters, not a general tuning surface.
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          minLength: 1
+          description: |
+            The search query, plain string. Whitespace is trimmed server-side before
+            retrieval and before being echoed back in the response's `query` field.
+        filters:
+          $ref: '#/components/schemas/SearchFilters'
+
+    SearchFilters:
+      type: object
+      additionalProperties: false
+      description: |
+        Optional retrieval filters. All three are independently optional; combine any
+        or none. `year` and `journal` genuinely narrow the result set, so whatever you
+        set for them is echoed back on `SearchResponse.filters` (only present when you
+        sent a `filters` object AND at least one of `year`/`journal`). `biomarker`
+        never filters — see its description below — so it's echoed separately on
+        `SearchResponse.query_expansion` instead.
+      properties:
+        year:
+          type: object
+          additionalProperties: false
+          description: |
+            Inclusive publication-year range. At least one of `min`/`max` is required
+            when `year` is present; `min` must be <= `max` when both are given.
+
+            **Implementation note:** applied AFTER retrieval, not as a native corpus
+            filter. The underlying search index's filter API is equality-only in every
+            confirmed use case in this codebase, and the corpus's `year` field is
+            inconsistently typed (numeric or string, including non-numeric values like
+            `"in press"` for unpublished work — see `Citation.metadata.year` below), so
+            a native range filter would be unreliable even if it existed. To compensate,
+            the server retrieves more candidates than usual when `year` is set AND could
+            actually exclude something. Practical effect: filtered requests cost a bit
+            more server-side work, and in rare cases (a very narrow year range against a
+            thin part of the corpus) may return fewer results than the usual full page
+            even when more matches exist further down the unfiltered ranking. A range
+            that can't exclude any real corpus year (e.g. `{ min: 0 }`, or a `max` at or
+            beyond the current year) is treated as a no-op: it's still applied (harmlessly
+            — it passes everything), but does NOT trigger the extra server-side fetch,
+            since there's nothing for the extra candidates to compensate for.
+          properties:
+            min:
+              type: integer
+              description: Earliest publication year to include (inclusive).
+              example: 2020
+            max:
+              type: integer
+              description: Latest publication year to include (inclusive).
+              example: 2024
+        journal:
+          type: string
+          minLength: 1
+          description: |
+            Exact-match (case-sensitive) against the corpus's `journal` metadata field.
+            Applied natively at retrieval time (no over-fetch needed) — this is a
+            straightforward equality filter, not a range query.
+
+            The value must match the journal name exactly as recorded in the corpus,
+            including casing, apostrophes, and punctuation — e.g. `PLoS ONE` and
+            `PLOS ONE` are different values. The `metadata.journal` field on returned
+            citations shows the recorded form. A value that matches nothing returns an
+            empty `results` array, not an error; papers with no recorded journal never
+            match any journal filter.
+          example: Human Reproduction
+        biomarker:
+          type: string
+          minLength: 1
+          description: |
+            A canonical biomarker id (NOT a free-text name) from CollectiveX Health's
+            biomarker vocabulary — e.g. `bm-estrogen`, `bm-hrv`. Unknown ids return `400
+            invalid_request` listing every valid id.
+
+            **Implementation note:** the corpus does not currently carry biomarker tags
+            on chunk metadata, so this cannot be a metadata filter — it never removes a
+            result from the response. Instead, the resolved biomarker's canonical name
+            and synonyms are appended to the search query before retrieval — the same
+            query-enrichment mechanism already used internally for `/v1/chat` and
+            `/v1/query` — so the ranker sees a richer signal without CollectiveX Health
+            inventing metadata that doesn't exist. The `query` field in the response is
+            always your original, un-augmented text; only the retrieval-internal query
+            changes. Because this never filters, it's echoed on
+            `SearchResponse.query_expansion`, not `SearchResponse.filters` — don't infer
+            that setting `biomarker` narrowed your results.
+          example: bm-estrogen
+
+    SearchResponse:
+      type: object
+      description: |
+        Flat JSON envelope returned by POST /v1/search. Always contains request_id, query,
+        and results. There is no `answer` or `deferral` concept on this endpoint — it never
+        runs an LLM, so it never generates or refuses to generate text. It DOES run the same
+        crisis classifier as /v1/chat and /v1/query before retrieval: on a crisis match,
+        `results` is an empty array and `crisis` is populated instead, at the same 200 status
+        those endpoints use, so crisis handling is uniform across every /v1/* endpoint.
+      required:
+        - request_id
+        - query
+        - results
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          description: UUID minted per request. Use for support correlation across PostHog / Langfuse / logs.
+        query:
+          type: string
+          description: The (trimmed) query you sent, echoed back.
+        results:
+          type: array
+          description: |
+            Ranked results from the peer-reviewed corpus, same Citation shape as
+            /v1/chat and /v1/query. Empty array when nothing in the corpus matches, or
+            when the crisis classifier short-circuited the request — neither is an error
+            condition.
+          items:
+            $ref: '#/components/schemas/Citation'
+        filters:
+          description: |
+            Present ONLY when the request's `filters` object set `year` and/or
+            `journal` — echoes back what was actually applied to narrow the result
+            set. Absent when the request had no `filters` object, or when `filters`
+            only set `biomarker` (which never filters — see `query_expansion` below).
+            Never contains a `biomarker` key: that echo lives on `query_expansion`
+            instead, so this field never claims a filtration that didn't happen.
+          type: object
+          additionalProperties: false
+          properties:
+            year:
+              type: object
+              additionalProperties: false
+              properties:
+                min:
+                  type: integer
+                max:
+                  type: integer
+            journal:
+              type: string
+        query_expansion:
+          description: |
+            Present ONLY when the request's `filters.biomarker` was set and resolved
+            to a valid canonical id. Separate from `filters` because biomarker never
+            removes a result from the response — it only appends the resolved
+            canonical name + synonyms to the retrieval query text (see
+            `SearchFilters.biomarker`). The RESOLVED canonical id + name are echoed
+            (not the raw id or free text you sent — the id you sent must already be
+            canonical, but the name is looked up).
+          type: object
+          additionalProperties: false
+          properties:
+            biomarker:
+              type: object
+              additionalProperties: false
+              properties:
+                id:
+                  type: string
+                  example: bm-estrogen
+                name:
+                  type: string
+                  example: estrogen
+        crisis:
+          description: |
+            Present when the crisis classifier fires on `query` before retrieval (self-harm,
+            acute symptoms, IPV) — same classifier and same payload shape as /v1/chat and
+            /v1/query's `crisis` field. Show the resources verbatim and route the caller away
+            from a search-results UI. Absent (not present at all) on every non-crisis request.
+            Never present alongside `filters` / `query_expansion` — no filter processing
+            happens once the crisis gate fires.
+          $ref: '#/components/schemas/CrisisPart'
 
     UIMessage:
       type: object
@@ -829,6 +1706,230 @@ components:
               type: string
               description: Generic human-readable failure message. Safe to display; do not parse.
               example: Generation failed. Please retry.
+    QueryResponse:
+      description: |
+        `/v1/query`'s response — the shared `SyncResponse` shape plus the
+        BETA `structured_answer` field. Defined as its own schema (rather
+        than putting `structured_answer` on `SyncResponse` directly) so
+        clients generated from this spec do not advertise `structured_answer`
+        on `/v1/chat`, which has no `response_format` field and can never
+        produce it.
+      allOf:
+        - $ref: '#/components/schemas/SyncResponse'
+        - type: object
+          properties:
+            structured_answer:
+              description: |
+                **BETA.** Present only when the request set
+                `response_format: "structured"` (see `QueryRequest.response_format`).
+                Absent — not null — on every request that omits it or sends
+                `response_format: "text"`, which is every request today: this field
+                is purely additive and never changes the meaning of `answer` or
+                `citations`.
+              oneOf:
+                - $ref: '#/components/schemas/StructuredAnswer'
+
+    StructuredAnswer:
+      type: object
+      description: |
+        Machine-readable rendering of the same answer as `answer`/`citations`,
+        reshaped so a partner can consume it without parsing markdown. Source
+        of truth: `lib/partner-format/` (`CanonicalAnswerSchema` + the adapter
+        selected via the key's partner slug; self-service keys and every
+        partner key today resolve to the `generic` adapter shown here).
+
+        **Always check `status` first.** It is the single required
+        discriminant for which of the five outcomes this payload represents —
+        never infer the outcome from `sections`/`citations` being empty.
+        `deferral` and `crisis` both emit exactly one non-empty section (see
+        `StructuredSection.kind`) precisely so that a client which only
+        renders `sections[].body` still shows real copy instead of a blank
+        card on a self-harm query or an evidence gap — but `status` is still
+        the field to branch program logic on.
+      required:
+        - format
+        - format_version
+        - schema_version
+        - status
+        - sections
+        - citations
+        - deferral
+        - crisis
+        - error
+        - disclaimer
+      properties:
+        format:
+          type: string
+          description: Which adapter rendered this payload. `"generic"` is the self-service public shape.
+          example: generic
+        format_version:
+          type: string
+          description: Bumped when this adapter's rendered shape changes in a breaking way.
+          example: '1'
+        schema_version:
+          type: string
+          description: Canonical answer schema version (`lib/partner-format/canonical.ts`).
+          example: '1'
+        status:
+          type: string
+          enum:
+            - answered
+            - ungrounded
+            - deferral
+            - crisis
+            - error
+          description: |
+            REQUIRED discriminant. `"answered"` — a grounded answer with at
+            least one citation. `"ungrounded"` — a real, non-empty answer with
+            zero citations; kept distinct from `"answered"` so a partner can
+            choose not to present it as evidence-backed. `"deferral"` — the
+            corpus lacked strong evidence; no answer was synthesized.
+            `"crisis"` — the crisis classifier short-circuited before
+            retrieval. `"error"` — the pipeline emitted an error chunk
+            (model/execute failure, mid-stream or outright); `sections` and
+            `citations` are always empty in this state — a truncated or
+            partial answer is never packaged as a grounded claim, even when
+            the top-level `answer` field (unaffected by `response_format`)
+            still carries a partial fragment for a text-mode caller.
+          example: answered
+        sections:
+          type: array
+          description: |
+            The answer broken into sections. Today's pipeline emits one markdown
+            answer with no section boundaries, so a normal answer is always a
+            single-element array; the shape supports more so a future
+            multi-section generation step needs no new schema. Empty when
+            `status` is `"error"`; exactly one synthetic section when `status`
+            is `"deferral"` or `"crisis"` (see `StructuredSection.kind`).
+          items:
+            $ref: '#/components/schemas/StructuredSection'
+        citations:
+          type: array
+          description: |
+            Same citations as the top-level `citations` field, reshaped through
+            the same `Citation` schema — no new citation shape, no new sanitizer.
+            Empty unless `status` is `"answered"` or `"ungrounded"`.
+          items:
+            $ref: '#/components/schemas/Citation'
+        deferral:
+          description: Same semantics as the top-level `deferral` field, mirrored here.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/DeferralPart'
+        crisis:
+          description: Same semantics as the top-level `crisis` field, mirrored here.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/CrisisPart'
+        error:
+          description: |
+            Populated only when `status` is `"error"`; `null` otherwise.
+            Mirrors the top-level `error` field verbatim — the same generic,
+            sanitized message, never raw internal error text.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/StructuredError'
+        disclaimer:
+          description: |
+            A versioned "research summary, not medical advice" notice.
+            Populated only when `status` is `"answered"` or `"ungrounded"`
+            (i.e. `sections` carries real answer content); `null` for
+            deferral/crisis/error, which carry their own dedicated safety
+            framing instead.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/StructuredDisclaimer'
+
+    StructuredError:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          description: Generic, sanitized failure message — safe to display, never parsed.
+          example: Generation failed. Please retry.
+
+    StructuredDisclaimer:
+      type: object
+      required:
+        - text
+        - version
+      properties:
+        text:
+          type: string
+          example: Research summary, not medical advice. Consult your clinician for personal health decisions.
+        version:
+          type: integer
+          description: Bumped whenever the disclaimer copy changes.
+          example: 1
+
+    StructuredSection:
+      type: object
+      description: A single section of a structured answer.
+      required:
+        - id
+        - kind
+        - heading
+        - body
+        - claims
+      properties:
+        id:
+          type: string
+          example: section-1
+        kind:
+          type: string
+          enum:
+            - answer
+            - crisis
+            - deferral
+          description: |
+            `"answer"` is real, model-generated or corpus-grounded content.
+            `"crisis"` / `"deferral"` are synthetic sections carrying
+            pre-approved safety copy — present so a client that renders
+            `sections[].body` and nothing else still shows something instead
+            of a blank card. `StructuredAnswer.status` is still the
+            authoritative discriminant; `kind` exists for section-only
+            renderers.
+          example: answer
+        heading:
+          type: ['string', 'null']
+          description: Null when the answer has no distinct heading (today's default).
+        body:
+          type: string
+          description: Full markdown/plain text body of this section.
+        claims:
+          type: array
+          description: |
+            Claims within this section, each bound to the citation ids that
+            ground it. Today's pipeline has no per-claim generation step, so
+            this is at most one claim covering the whole section body, bound to
+            every citation returned for the answer — never a fabricated
+            sentence-level binding. A section with no supporting citations has
+            zero claims, not a claim with an empty `citation_ids`. Always empty
+            on a `"crisis"`/`"deferral"` `kind` section.
+          items:
+            $ref: '#/components/schemas/StructuredClaim'
+
+    StructuredClaim:
+      type: object
+      required:
+        - id
+        - text
+        - citation_ids
+      properties:
+        id:
+          type: string
+          example: claim-1
+        text:
+          type: string
+          description: The claim text (today, the full section body).
+        citation_ids:
+          type: array
+          description: Ids into this response's `citations` array that ground this claim.
+          items:
+            type: string
+          example: ['CXH-00835']
 
     Citation:
       type: object
@@ -880,8 +1981,14 @@ components:
               description: Peer-review journal name.
               example: Human Reproduction
             authors:
-              type: string
-              description: Author list (joined as a single string).
+              description: |
+                Author list — either a single joined string or an array of
+                author strings; both forms occur in corpus metadata.
+              oneOf:
+                - type: string
+                - type: array
+                  items:
+                    type: string
               example: Shultz et al.
             title:
               type: string
@@ -970,6 +2077,83 @@ components:
           description: Operating hours, when not 24/7 (optional).
           example: 'Mon–Fri 9am–5pm ET'
 
+    JobResponse:
+      type: object
+      description: |
+        Current state of one async job. `payload` and `result` are opaque
+        JSON — their shape is defined per `job_type`, not by this
+        envelope (see the `job_type` field description).
+      required:
+        - request_id
+        - id
+        - job_type
+        - status
+        - payload
+        - result
+        - error
+        - expires_at
+        - created_at
+        - updated_at
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          description: UUID minted per request. Use for support correlation across PostHog / Langfuse / logs.
+        id:
+          type: string
+          format: uuid
+          description: The job's own id (distinct from `request_id`, which identifies this poll request).
+        job_type:
+          type: string
+          description: |
+            Identifies what kind of work this job represents (e.g.
+            "lab_panel_interpretation") and therefore the shape of
+            `payload`/`result`. Not an enum in this spec — new job types
+            ship without a spec change; consult the job type's own
+            documentation for its payload/result shape.
+        status:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+            - expired
+          description: |
+            Current lifecycle state. `queued` → `running` → one of
+            `succeeded` / `failed` / `expired` (terminal); `queued` can
+            also go directly to `expired` if never claimed in time.
+        payload:
+          description: The job's input, as it was created with. Shape depends on `job_type`.
+        result:
+          description: The job's output. `null` until `status` is `succeeded`. Shape depends on `job_type`.
+        error:
+          description: |
+            Generic human-readable failure message, present when `status`
+            is `failed`. Safe to display; do not parse. This is enforced
+            at the write boundary (`lib/jobs/store.ts`'s `failJob`), not
+            merely promised: a failure message is rejected before it is
+            ever stored unless it is non-empty, at most 500 characters,
+            and contains no URL.
+          oneOf:
+            - type: 'null'
+            - type: string
+              maxLength: 500
+        expires_at:
+          description: When this job stops being considered valid, if a deadline was set. `null` means no deadline.
+          oneOf:
+            - type: 'null'
+            - type: string
+              format: date-time
+        created_at:
+          type: string
+          format: date-time
+          description: When the job was created.
+        updated_at:
+          type: string
+          format: date-time
+          description: When the job's status/result last changed.
+
     ErrorEnvelope:
       type: object
       description: |
@@ -998,6 +2182,7 @@ components:
                 - corpus_unavailable
                 - grounding_deferral
                 - crisis_resources
+                - not_found
                 - internal_error
             message:
               type: string
@@ -1072,7 +2257,9 @@ components:
       description: |
         429 Too Many Requests. Rate limit exceeded. Read the Retry-After header (seconds)
         before retrying. Also check X-RateLimit-Remaining on successful responses to
-        self-throttle before hitting 429.
+        self-throttle before hitting 429. Limits are per-key configurable (a partner may
+        have a non-default requests-per-minute ceiling and/or a requests-per-day ceiling);
+        X-RateLimit-* on this response always reflects whichever budget was exceeded.
       headers:
         Retry-After:
           description: Seconds until the rate-limit window resets. Wait this long before retrying.
@@ -1086,7 +2273,7 @@ components:
             type: string
             format: uuid
         X-RateLimit-Limit:
-          description: Maximum requests per minute.
+          description: Maximum requests for the window that was exceeded (per-minute by default, or per-day if this key has a daily budget and that's what was hit).
           schema:
             type: integer
             example: 60
@@ -1131,20 +2318,71 @@ components:
 
     CorpusUnavailable:
       description: |
-        503 Service Unavailable. The research corpus (Agentset) is temporarily unavailable.
-        Retry with exponential backoff. This is a transient condition.
+        503 Service Unavailable. A transient condition — retry with exponential
+        backoff. Two distinct causes share this status code, distinguishable by
+        `error.code`:
+          - `corpus_unavailable`: the research corpus (Agentset) is temporarily
+            unavailable.
+          - `internal_error`: an upstream dependency required to authenticate or
+            rate-limit the request (Unkey) is temporarily unavailable — includes
+            the "rate-limit service degraded" case described under "Rate limits"
+            above. This variant always carries a `Retry-After` header.
       headers:
         X-Request-Id:
           description: Request UUID.
           schema:
             type: string
             format: uuid
+        Retry-After:
+          description: Seconds to wait before retrying. Present on the `internal_error` (Unkey-outage) variant; absent on `corpus_unavailable`.
+          required: false
+          schema:
+            type: integer
+            example: 5
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            corpus_unavailable:
+              summary: Research corpus (Agentset) unavailable
+              value:
+                error:
+                  code: corpus_unavailable
+                  message: Research corpus temporarily unavailable. Please retry.
+                  request_id: 550e8400-e29b-41d4-a716-446655440000
+            auth_or_ratelimit_service_unavailable:
+              summary: Unkey (auth/rate-limit) service degraded
+              value:
+                error:
+                  code: internal_error
+                  message: Rate limit service temporarily unavailable. Please retry.
+                  request_id: 660e8400-e29b-41d4-a716-446655440001
+
+    JobNotFound:
+      description: |
+        404 Not Found. Either no job exists with this id, or it belongs
+        to a different API key — the two cases are indistinguishable by
+        design (`GET /v1/jobs/{id}` never confirms another partner's job
+        id exists).
+      headers:
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+        Retry-After:
+          description: Seconds to wait before retrying. Present on the `internal_error` (Unkey-outage) variant; absent on `corpus_unavailable`.
+          required: false
+          schema:
+            type: integer
+            example: 5
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
           example:
             error:
-              code: corpus_unavailable
-              message: Research corpus temporarily unavailable. Please retry.
+              code: not_found
+              message: Job not found.
               request_id: 550e8400-e29b-41d4-a716-446655440000

@@ -1,47 +1,104 @@
 ---
 title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+description: "Send one question to /v1/query and get one grounded, cited answer back."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+The fastest way in is `POST /v1/query`: send one question, get back one JSON
+response, done. The endpoint is stateless — no session, no setup, no history
+to manage.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Note>
+Run this from a server or your terminal, never from browser code — see
+[Authentication](/authentication) for why the key is server-side only.
+</Note>
 
-## Prerequisites
+## 1. Ask a question
 
-Before you begin, you must have:
+```bash
+curl -sS -X POST https://api.collectivex.health/v1/query \
+  -H "Authorization: Bearer $CXH_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{
+    "question": "What does the research say about magnesium for perimenopause sleep?"
+  }'
+```
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+## 2. Read the response
 
-## Get started
+What comes back (`SyncResponse`, abbreviated):
 
-<Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+```typescript
+interface SyncResponse {
+  request_id: string;          // UUID — use for support correlation
+  answer: string;              // empty string on deferral or crisis
+  citations: Citation[];       // empty array on deferral or crisis
+  deferral?: { originalQuery: string };  // corpus lacked strong evidence
+  crisis?: { category, locale, originalQuery, resources };  // safety classifier fired
+  error?: { message: string }; // generic sanitized failure message (v1.1)
+}
+```
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+```json
+{
+  "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "answer": "Magnesium supplementation has been associated with modest improvements in sleep quality during perimenopause...",
+  "citations": [
+    {
+      "id": "CXH-00835",
+      "score": 0.92,
+      "text": "Transdermal estradiol was associated with significant reductions...",
+      "metadata": { "doi": "10.1093/humrep/dead156", "year": "2023" }
+    }
+  ]
+}
+```
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+## 3. Handle all three outcomes
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+A response is not always a grounded answer. Your integration must handle the
+deferral and crisis short-circuits too:
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+- **Deferral** — `answer` is an empty string, `citations` an empty array, and
+  `deferral.originalQuery` is set. The corpus lacks strong evidence for the
+  query. Present the `originalQuery` back to the user and do not synthesize
+  an answer from training data.
+- **Crisis** — `answer` is an empty string, `citations` an empty array, and
+  `crisis` carries a `category` (`self-harm`, `acute-symptom`, or `ipv`), a
+  `locale`, the `originalQuery`, and a `resources` array. Show the resources
+  verbatim and route the user away from research framing. Never omit or
+  reorder resources.
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+Citations only ever come from the `citations` array — never fabricate or
+paraphrase a citation that is not in it.
+
+## Already building `/v1/chat` request bodies?
+
+`/v1/query` also accepts a single-element `messages` array in place of
+`question`, for continuity with callers already building `/v1/chat` bodies:
+
+```bash
+curl -sS -X POST https://api.collectivex.health/v1/query \
+  -H "Authorization: Bearer $CXH_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{
+    "messages": [
+      {
+        "id": "msg_smoke_1",
+        "role": "user",
+        "parts": [{ "type": "text", "text": "How does luteal-phase progesterone affect sleep?" }]
+      }
+    ]
+  }'
+```
+
+Unlike `/v1/chat`, this array must contain exactly one message with role
+`user` — `/v1/query` has no multi-turn concept. Sending more than one
+message, or a different role, returns `400 invalid_request`. Exactly one of
+`question` or `messages` is required — not both.
+
+## Next steps
+
+- Machine-readable output: [Structured answers (beta)](/structured-answers)
+- What can go wrong: [Errors and rate limits](/errors-and-rate-limits)
+- Conversations and streaming, or retrieval-only search: see the API
+  Reference tab for `/v1/chat` and `/v1/search`
