@@ -10,6 +10,13 @@
 # Hand-written YAML (not generated). Surface is tiny; static YAML is PR-reviewable
 # and beats a generator per 10-RESEARCH.md "Don't Hand-Roll" section.
 # Validated by: pnpm openapi:lint (redocly lint)
+#
+# PARTNER DOCS SYNC: the public docs site (docs.collectivex.health, Mintlify)
+# renders from the separate repo collective-x/docs, whose openapi.yaml is a
+# COPY of this file. When you change this spec, copy it there too:
+#   git -C <path-to-collective-x/docs> pull && \
+#     cp openapi/v1-chat.yaml <path-to-collective-x/docs>/openapi.yaml && commit+push
+# (Mintlify auto-deploys on push to that repo's main.)
 
 openapi: 3.1.0
 

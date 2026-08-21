@@ -53,3 +53,15 @@ Install our GitHub app from your [dashboard](https://dashboard.mintlify.com/sett
 
 ### Resources
 - [Mintlify documentation](https://mintlify.com/docs)
+
+## Where content comes from
+
+- **openapi.yaml is a generated copy** of the canonical spec in
+  [`collective-x/cx-new`](https://github.com/collective-x/cx-new) at
+  `openapi/v1-chat.yaml`. Never edit it here — change it in cx-new (reviewed +
+  redocly-linted there), then run `./scripts/sync-openapi.sh` and push.
+- The guide pages (`*.mdx`) are authored in this repo.
+- Pushing to `main` auto-deploys **docs.collectivex.health** via Mintlify's
+  GitHub app. If a push doesn't deploy within a few minutes, push an empty
+  commit ("Trigger Mintlify deployment") — the webhook occasionally needs a
+  nudge.
