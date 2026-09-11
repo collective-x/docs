@@ -42,6 +42,21 @@ Your app owns end-user identity. We never receive end-user PII. The partner
 key is shared across all of your end-users; you take the contract that no
 PHI is forwarded to us in prompts.
 
+## Native mobile apps: short-lived session tokens
+
+The server-side rule above is absolute for browsers and does not change.
+For a **native mobile app** there is a second sanctioned pattern: your
+backend presents the long-lived key to `POST /v1/session-tokens` and hands
+the returned short-lived, scoped key straight to the app, which then calls
+`/v1/query` and `/v1/chat` directly. A session key expires after at most
+60 minutes, carries a total request allowance (`max_requests`), can only
+reach `/v1/query` and `/v1/chat`, and can never mint further session keys.
+The long-lived key itself still never leaves your server.
+
+See the **Session tokens** operation in the API Reference tab for the
+request and response shapes, and the "Mobile-direct access" section of the
+API introduction for a runnable mint-then-use example.
+
 ## Example proxy
 
 Point your client at YOUR own proxy, never at `api.collectivex.health`
