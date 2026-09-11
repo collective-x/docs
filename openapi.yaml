@@ -22,13 +22,20 @@ openapi: 3.1.0
 
 info:
   title: CollectiveX Health Partner API
+  # 1.8 -> 1.9: additive minor bump for POST /v1/session-tokens
+  # (session-tokens PR 2/3) — mint a short-lived, scoped Unkey key for a
+  # partner's mobile client. Dark-launched behind
+  # PARTNER_SESSION_TOKENS_ENABLED (bare 404 off by default); documented
+  # here ahead of the flag flip so the contract is reviewable now.
+  # 2026-09-11: flag flipped on in production — generally available. The
+  # 🚧 not-GA markers were removed (description-only edit, no bump).
   # 1.7 -> 1.8: spec cleanup.
   # 1.6 -> 1.7: additive minor bump for GET /v1/jobs/{id} (async-jobs
   # skeleton) + the `not_found` error code (#818 adversarial review H5 —
   # the branch shipped both without touching this file at all). 1.6 itself
   # covers everything underneath this layer in the restacked chain
   # (#816, #820, #819 structured responses, #817 per-key rate budgets).
-  version: '1.8'
+  version: '1.9'
   description: |
     The CollectiveX Health Partner API gives your product access to a grounded,
     peer-reviewed women's-health research corpus. Every answer includes inline
@@ -43,15 +50,39 @@ info:
 
     ---
 
-    ## API keys are server-side only
+    ## API keys: server-side, or native-mobile-direct via short-lived session tokens
 
-    > **Warning:** Do NOT call `/v1/query` or `/v1/chat`
-    > directly from a browser. Build a server-side proxy (a Next.js Route
-    > Handler, Express middleware, or Lambda function) that forwards requests
-    > and authenticates with the partner key from a secret manager.
-    > Browser-direct usage will leak the key to your users.
+    > **Warning:** Do NOT call `/v1/query` or `/v1/chat` directly from a
+    > browser or a mobile app using your long-lived partner key. Build a
+    > server-side proxy (a Next.js Route Handler, Express middleware, or
+    > Lambda function) that forwards requests and authenticates with the
+    > partner key from a secret manager. Browser-direct usage will leak the
+    > key to your users. **This rule is absolute and does not change** —
+    > everything below adds a second sanctioned pattern for native mobile
+    > apps, it does not relax this one, and it does not extend to browsers.
 
-    The recommended integration pattern:
+    **For web apps, server-to-server is the supported and recommended
+    integration**, full stop: keep your long-lived partner key on your own
+    backend and proxy every browser request through it. This is what
+    HumanGo does today — the browser never sees any CollectiveX Health
+    credential, long-lived or short-lived.
+
+    **Short-lived session tokens exist for exactly one case: a native
+    mobile app that streams from us directly**, without a round trip
+    through your backend for every turn. They are **not** a sanctioned way
+    to call this API from a browser or any other JavaScript context — a
+    token handed to client-side JS is sitting in developer tools same as
+    the long-lived key would be, just on a shorter clock. To be plain about
+    how this is enforced: it's a partner-trust rule, stated here and in the
+    partner terms, not a technical one — we do not block browser-origin
+    requests by user-agent or otherwise, and a session token will work if
+    you send it from one. We reserve the right to revoke a partner's keys
+    for minting or using session tokens outside native mobile apps.
+
+    There are two sanctioned integration patterns:
+
+    **1. Server-to-server proxy** (recommended default, and the only
+    supported pattern for web):
 
     ```
     Browser  →  useChat({ api: '/api/proxy/chat' })
@@ -60,6 +91,28 @@ info:
                   ↓  Authorization: Bearer $CXH_API_KEY (from env)
     POST https://api.collectivex.health/v1/chat  (or /v1/query)
     ```
+
+    **2. Native-mobile-direct, via a short-lived session token** (see
+    "Mobile-direct access" below): for a native mobile app you don't want proxying every chat
+    turn through your own backend, your backend presents the long-lived
+    key to `POST /v1/session-tokens` and hands the returned short-lived key
+    straight to that app, which calls `/v1/query` / `/v1/chat` with it
+    directly:
+
+    ```
+    Your backend  →  POST /v1/session-tokens  (Authorization: Bearer $CXH_API_KEY)
+                        ↓  { key: "...", expires_in_seconds: 900, scope: ["query","chat"] }
+    Mobile app    →  POST /v1/query (or /v1/chat)  (Authorization: Bearer <session key>)
+    ```
+
+    The session key can call **only** `/v1/query` and `/v1/chat`, expires in
+    at most 60 minutes, and can never mint another session token. See
+    "Mobile-direct access" below for the full contract and a runnable
+    example. **The long-lived key itself must never leave your server** —
+    embedding it in a mobile *or* web client is exactly the leak this
+    section exists to prevent; the short-lived session key it mints is
+    safe to hand to a native mobile client, and only a native mobile
+    client.
 
     Your app owns end-user identity. We never receive end-user PII. The partner
     key is shared across all of your end-users; you take the contract that no
@@ -268,7 +321,13 @@ info:
 
     ### Building a chat UI (`useChat` via your server-side proxy)
 
-    Point `useChat` at YOUR own proxy, never at `api.collectivex.health` directly:
+    Point `useChat` at YOUR own proxy, never at `api.collectivex.health`
+    directly. If this `useChat` instance runs in a native mobile app that
+    holds a short-lived session token (native mobile only, not browser/JS
+    — see "API keys" above), point it
+    at `/v1/chat` directly with that token instead of a proxy. A browser
+    `useChat` instance always goes through your proxy — never the
+    long-lived key, and never a session token either:
 
     ```tsx
     'use client';
@@ -322,8 +381,15 @@ info:
 
     Default limit for every key: **60 requests per minute**, shared across
     every `/v1/*` endpoint that requires a key — today that's `/v1/query`,
-    `/v1/chat`, and `/v1/jobs/{id}` — per API key. (A future endpoint on this
-    same key naturally joins the same budget unless we say otherwise.)
+    `/v1/chat`, `/v1/jobs/{id}`, and `POST /v1/session-tokens`. (A future
+    endpoint on this same key naturally
+    joins the same budget unless we say otherwise.)
+
+    Two session-token consequences worth sizing for: **minting is itself a
+    metered request** against your budget (one mint = one request), and a
+    **session key does not get its own budget** — it draws from its parent
+    long-lived key's pool, so the limit is effectively per *partner*, not
+    per key, once session tokens are in play.
     Limits are **per-key configurable** — some partners are provisioned with
     a different requests-per-minute ceiling, and/or a requests-per-day
     ceiling, on request. There is no implicit daily cap unless your key has
@@ -346,6 +412,55 @@ info:
     A genuine 429 always carries a `Retry-After` header; in a rare
     clock-skew case its value may be `0`, which clients should treat as
     "retry after a short backoff", not "retry immediately".
+
+    ---
+
+    ## Mobile-direct access — short-lived session tokens
+
+    Session tokens are for native mobile apps only — see "API keys" above
+    for why this doesn't extend to browsers. If your product has a native
+    mobile app you'd rather not proxy every chat turn through your own
+    backend, your backend can mint a short-lived, scoped key instead of
+    embedding the long-lived one in the app:
+
+    ```bash
+    # 1. Your backend mints a session token (long-lived key, server-side only)
+    curl -sS -X POST https://api.collectivex.health/v1/session-tokens \
+      -H "Authorization: Bearer $CXH_API_KEY" \
+      -H "content-type: application/json" \
+      -d '{"ttl_seconds": 900}'
+    # -> { "key": "<short-lived key>", "expires_in_seconds": 900,
+    #      "scope": ["query", "chat"], ... }
+
+    # 2. Hand `key` to the mobile client, which calls /v1/query or /v1/chat
+    #    with it directly:
+    curl -sS -X POST https://api.collectivex.health/v1/query \
+      -H "Authorization: Bearer <short-lived key>" \
+      -H "content-type: application/json" \
+      -d '{"question": "What does the research say about magnesium for perimenopause sleep?"}'
+    ```
+
+    What a session key can and can't do:
+
+    - Scoped to `/v1/query` and `/v1/chat` only — every other endpoint,
+      including `POST /v1/session-tokens` itself, returns `403 forbidden`
+      (no chaining a session key into another session key).
+    - Expires automatically 60 seconds to 60 minutes after minting
+      (`ttl_seconds`, default 900 = 15 minutes); Unkey deletes it on its
+      own, nothing to clean up. An expired key returns `401 unauthorized`
+      with an "API key expired" message — treat that as "fetch a fresh
+      token from your backend", not as an error to alert on.
+    - Shares its parent long-lived key's rate-limit budget and telemetry —
+      minting session keys does not multiply your rate limit. A budget
+      change to the long-lived key reaches outstanding session keys only
+      after they expire, since each session key's limits are captured at
+      mint time.
+    - Always capped at `max_requests` total requests (1–10,000, default
+      200), independent of the rate-limit window. An exhausted key
+      returns `403 forbidden` permanently — mint a new one, don't retry.
+
+    See the `POST /v1/session-tokens` operation below for the full request/
+    response schema and error contract.
 
     ---
 
@@ -380,6 +495,11 @@ tags:
       Poll the status of a longer-running job. Skeleton surface today —
       only reading an existing job is exposed; nothing in this API creates
       one yet (see the operation description below).
+  - name: Session tokens
+    description: |
+      Mint a short-lived, scoped key for a mobile client from your
+      long-lived partner key — see "Mobile-direct access" in the
+      introduction.
 
 paths:
   /v1/query:
@@ -398,7 +518,11 @@ paths:
         fully supported; there is no deprecation or migration deadline for
         `stream: false` on `/v1/chat`.
 
-        **Server-to-server only.** Do NOT call this endpoint from browser-side code.
+        **Server-to-server (the only supported pattern for web), or
+        native-mobile-direct via a short-lived session token** minted by
+        your backend through `POST /v1/session-tokens` (native mobile only,
+        not browser/JS — see "API keys" above). Never embed your long-lived key in any client,
+        browser or mobile.
 
         Internally this is the exact same pipeline as `/v1/chat` — same
         retrieval, safety, and grounding behavior. Nothing about answer quality
@@ -449,7 +573,7 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/chat; per-key configurable, default 60).
+              description: Maximum requests per minute for this key (shared budget with /v1/chat, /v1/jobs/{id}, and /v1/session-tokens; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
@@ -662,7 +786,11 @@ paths:
         `stream: false` to receive a synchronous JSON response (the `SyncResponse` shape)
         suited for Claude Skills, MCP tool calls, and agent pipelines.
 
-        **Server-to-server only.** Do NOT call this endpoint from browser-side code.
+        **Server-to-server (the only supported pattern for web), or
+        native-mobile-direct via a short-lived session token** minted by
+        your backend through `POST /v1/session-tokens` (native mobile only,
+        not browser/JS — see "API keys" above). Never embed your long-lived key in any client,
+        browser or mobile.
 
         Rate limits are communicated via `X-RateLimit-*` headers on every
         response and are shared with `/v1/query` per API key
@@ -711,7 +839,7 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/query; per-key configurable, default 60).
+              description: Maximum requests per minute for this key (shared budget with /v1/query, /v1/jobs/{id}, and /v1/session-tokens; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
@@ -875,8 +1003,12 @@ paths:
         that work can land ahead of the first job type without a
         breaking spec change later.
 
-        **Server-to-server only.** Do NOT call this endpoint from
-        browser-side code.
+        **Server-to-server only, with your long-lived key.** A short-lived
+        session token (see "Mobile-direct access" above) cannot call this
+        endpoint: its scope covers only
+        `/v1/query` and `/v1/chat`, so it gets `403 forbidden` here like on
+        every other endpoint. Do NOT call this endpoint from browser-side
+        code, and never embed your long-lived key in any client.
 
         Scoping: a job is visible only to the API key that owns it. A
         job id that doesn't exist and a job id that belongs to a
@@ -910,7 +1042,7 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/query and /v1/chat; per-key configurable, default 60).
+              description: Maximum requests per minute for this key (shared budget with /v1/query, /v1/chat, and /v1/session-tokens; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
@@ -993,6 +1125,193 @@ paths:
         '503':
           $ref: '#/components/responses/CorpusUnavailable'
 
+  /v1/session-tokens:
+    post:
+      operationId: postSessionTokens
+      summary: Mint a short-lived, scoped session token for a mobile client
+      tags:
+        - Session tokens
+      description: |
+        Exchanges your long-lived partner key for a short-lived, scoped
+        Unkey key that a mobile client can call `/v1/query` and `/v1/chat`
+        with directly — see "Mobile-direct access" in the introduction for
+        the full pattern and a runnable example.
+
+        **Requires your long-lived partner key.** A session key can never
+        call this endpoint — it always gets `403 forbidden`, whether that's
+        a mistaken integration (the mobile client was accidentally handed
+        the mint URL) or an attacker trying to extend a leaked session
+        key's life. There is no session-key chaining.
+
+        The minted key:
+          - Can call **only** `/v1/query` and `/v1/chat` — every other
+            endpoint, including this one, returns `403 forbidden`.
+          - Expires automatically between 60 seconds and 60 minutes after
+            minting (`ttl_seconds`, default 900 = 15 minutes). Unkey
+            deletes expired keys on its own; there is nothing to clean up.
+            An expired key returns `401 unauthorized` with an "API key
+            expired" message — your mobile client should treat that as
+            "ask my backend for a fresh token", not as an error to alert
+            on.
+          - Shares your long-lived key's rate-limit budget and telemetry —
+            minting session keys does not create additional rate-limit
+            headroom. A budget change to your long-lived key reaches
+            outstanding session keys only after they expire (at most 60
+            minutes later), since each key's limits are captured at mint
+            time, not read through live.
+          - Stops working after `max_requests` total requests (default
+            200; session keys are never uncapped), independent of the
+            rate-limit window. An exhausted key returns `403 forbidden`
+            with a "mint a new session token" message — permanently, so
+            do not retry; mint a new token.
+          - Stops working everywhere, within one deploy, if the
+            session-token feature is disabled — the feature flag is a kill
+            switch for outstanding keys, not just for new mints.
+
+        Minting itself is a normal partner API call: authenticated and
+        rate-limited exactly like `/v1/query` and `/v1/chat`, and it
+        charges your long-lived key's own requests-per-minute (and, if
+        configured, requests-per-day) budget — one mint call is one
+        metered request.
+
+        An empty request body is valid and mints a 15-minute key with the
+        default 200-request allowance; both fields are optional.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionTokenRequest'
+            examples:
+              defaults:
+                summary: Empty body — 15-minute key, 200-request default cap
+                value: {}
+              custom_ttl_and_cap:
+                summary: 5-minute key capped at 50 requests
+                value:
+                  ttl_seconds: 300
+                  max_requests: 50
+      responses:
+        '201':
+          description: |
+            Created. The plaintext session key is returned exactly once —
+            it is never retrievable again, and CollectiveX Health never
+            logs or persists it server-side. Store it only for as long as
+            it takes to hand it to the client. The response carries
+            `Cache-Control: no-store` (RFC 6749 §5.1 discipline for a
+            bearer-secret response); anything you put in front of your
+            mint call must honour it.
+          headers:
+            Cache-Control:
+              description: Always `no-store` — this response carries a bearer secret and must never be cached by any intermediary or client HTTP cache.
+              required: true
+              schema:
+                type: string
+                example: no-store
+            X-Request-Id:
+              description: UUID correlation key for this request (propagated to PostHog + Langfuse).
+              required: true
+              schema:
+                type: string
+                format: uuid
+                example: 550e8400-e29b-41d4-a716-446655440000
+            X-RateLimit-Limit:
+              description: Maximum requests per minute for your long-lived key (shared budget with /v1/query, /v1/chat, and /v1/jobs/{id}; per-key configurable, default 60).
+              required: true
+              schema:
+                type: integer
+                example: 60
+            X-RateLimit-Remaining:
+              description: Requests remaining in the current per-minute rate-limit window.
+              required: true
+              schema:
+                type: integer
+                example: 59
+            X-RateLimit-Reset:
+              description: Unix timestamp (seconds) when the per-minute rate-limit window resets.
+              required: true
+              schema:
+                type: integer
+                example: 1717000060
+            X-RateLimit-Limit-Daily:
+              description: Present only when your long-lived key has a configured daily (rpd) budget. Maximum requests per day.
+              required: false
+              schema:
+                type: integer
+                example: 5000
+            X-RateLimit-Remaining-Daily:
+              description: Present only when your long-lived key has a configured daily (rpd) budget. Requests remaining in the current day's window.
+              required: false
+              schema:
+                type: integer
+                example: 4321
+            X-RateLimit-Reset-Daily:
+              description: Present only when your long-lived key has a configured daily (rpd) budget. Unix timestamp (seconds) when the daily window resets.
+              required: false
+              schema:
+                type: integer
+                example: 1717003600
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionTokenResponse'
+              examples:
+                minted_default:
+                  summary: Default 15-minute key with the 200-request default cap
+                  value:
+                    request_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+                    key: 2f8a9c1d4e5b6a7c8d9e0f1a2b3c4d5e
+                    key_id: key_2f8a9c1d4e5b6a7c
+                    expires_at: '2026-08-23T15:15:00.000Z'
+                    expires_in_seconds: 900
+                    scope: [query, chat]
+                    max_requests: 200
+                minted_with_cap:
+                  summary: 5-minute key capped at 50 requests
+                  value:
+                    request_id: b2c3d4e5-f6a7-8901-bcde-f12345678901
+                    key: 3a9b0d2e5f6c7b8d9e0f1a2b3c4d5e6f
+                    key_id: key_3a9b0d2e5f6c7b8d
+                    expires_at: '2026-08-23T15:05:00.000Z'
+                    expires_in_seconds: 300
+                    scope: [query, chat]
+                    max_requests: 50
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: |
+            Session-token minting is not available in this deployment (the
+            create-scoped credential is not configured). Unlike the 503,
+            this is a PERMANENT condition until operators fix the deploy —
+            there is deliberately no Retry-After header, and clients
+            should not retry (each retry is a metered request against your
+            own budget). Body is the standard `internal_error` envelope.
+          headers:
+            X-Request-Id:
+              description: Request UUID.
+              schema:
+                type: string
+                format: uuid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: internal_error
+                  message: Session token minting is not available.
+                  request_id: 550e8400-e29b-41d4-a716-446655440000
+        '503':
+          $ref: '#/components/responses/SessionTokenUnavailable'
+
 
 components:
   securitySchemes:
@@ -1001,8 +1320,20 @@ components:
       scheme: bearer
       bearerFormat: cxh_pk_live_*
       description: |
-        Partner API key issued by CollectiveX Health. Contact partners@collectivex.health
-        to obtain a key. Keep it server-side only — never expose in client bundles.
+        Bearer token used by every `/v1/*` endpoint. Two kinds of key work here:
+          - **Long-lived partner key** (`cxh_pk_live_*`) — issued by
+            CollectiveX Health (contact partners@collectivex.health). Keep
+            it server-side only — never expose it in client bundles or
+            mobile app code. This rule is absolute and does not change for
+            any endpoint.
+          - **Short-lived session key** — minted server-side via
+            `POST /v1/session-tokens` from a long-lived key. Safe to hand
+            to a native mobile client only — not a browser or other
+            JavaScript context, see "API keys" in the description above.
+            It's scoped to `/v1/query` and `/v1/chat` only, expires in at
+            most 60 minutes, and can't mint further session keys.
+            `POST /v1/session-tokens` itself only ever accepts the
+            long-lived key.
 
   schemas:
     ChatRequest:
@@ -1646,6 +1977,104 @@ components:
           format: date-time
           description: When the job's status/result last changed.
 
+    SessionTokenRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Request body for POST /v1/session-tokens. Uses
+        additionalProperties: false (mirrors Zod .strict() on the server).
+        Both fields are optional — an empty body (or no body at all) mints
+        a 15-minute key capped at 200 requests.
+      properties:
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          default: 900
+          description: |
+            How long the minted key stays valid, in seconds. Must be
+            60–3600 (1 minute to 1 hour) — values outside the range are
+            REJECTED with `400 invalid_request`, not clamped. A
+            "short-lived" credential that can outlive an hour isn't one.
+            Defaults to 900 (15 minutes).
+        max_requests:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 200
+          description: |
+            Total request allowance for the minted key, independent of the
+            rate-limit window (maps to the Unkey key's remaining-uses
+            credits). Defaults to 200 — session keys are never uncapped.
+            Once exhausted, the key returns `403 forbidden` even if it
+            hasn't expired yet; mint a new token. Note the allowance
+            counts every authenticated request made with the key,
+            INCLUDING ones rejected with 4xx (e.g. 429s from a retry
+            loop). A mobile session that needs more than 10,000 calls in
+            under an hour is a scraping pattern, not a chat session —
+            contact partners@collectivex.health if your use case genuinely
+            needs a higher cap.
+
+    SessionTokenResponse:
+      type: object
+      required:
+        - request_id
+        - key
+        - key_id
+        - expires_at
+        - expires_in_seconds
+        - scope
+        - max_requests
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          description: UUID for this request. Include when contacting support.
+        key:
+          type: string
+          description: |
+            The plaintext short-lived key, shown exactly once. It is never
+            retrievable again, and CollectiveX Health never logs or stores
+            it server-side — if you lose it, mint a new one. Treat it as
+            an opaque bearer token: its exact format is not part of the
+            API contract and may differ from the long-lived key's
+            `cxh_pk_live_*` format.
+        key_id:
+          type: string
+          description: |
+            The minted key's Unkey key id (not a secret — safe to log).
+            Distinct from `key`; use this, not the plaintext key, for
+            support correlation.
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            ISO 8601 timestamp when the key stops working. Calls made with
+            it after this time return `401 unauthorized`.
+        expires_in_seconds:
+          type: integer
+          description: |
+            Seconds until `expires_at`, computed at response time from the
+            same instant `expires_at` describes (so the two fields never
+            disagree). Equal to the applied `ttl_seconds` give or take the
+            mint round-trip. `expires_at` is authoritative and is enforced
+            against Unkey's server clock.
+        scope:
+          type: array
+          items:
+            type: string
+            enum: [query, chat]
+          description: |
+            Fixed allowlist of endpoints this key may call — always
+            `["query", "chat"]` today. Server-assigned; the mint request
+            cannot choose or widen it.
+        max_requests:
+          type: integer
+          description: |
+            The request allowance actually applied — the request value, or
+            the 200-request default. Always present; session keys are
+            never uncapped.
+
     ErrorEnvelope:
       type: object
       description: |
@@ -1708,7 +2137,11 @@ components:
     Unauthorized:
       description: |
         401 Unauthorized. Missing, malformed, or invalid API key. Check that the Authorization
-        header is present and has the form `Bearer <key>`.
+        header is present and has the form `Bearer <key>`. An EXPIRED session token also
+        returns 401, with an "API key expired" message — session-token clients should treat
+        that specific message as "request a fresh token from your backend", not as an alert.
+        Session tokens additionally return 401 whenever the session-token feature is disabled
+        (the feature flag is a kill switch for outstanding keys).
       headers:
         X-Request-Id:
           description: Request UUID.
@@ -1727,8 +2160,16 @@ components:
 
     Forbidden:
       description: |
-        403 Forbidden. Key is valid but does not have permission for this operation.
-        Contact partners@collectivex.health.
+        403 Forbidden. Key is valid but does not have permission for this operation. Four
+        cases, distinguishable by `error.message`: (1) the key's scope excludes this
+        endpoint — e.g. a session token calling anything other than /v1/query or /v1/chat,
+        including /v1/session-tokens itself; (2) the key's total request allowance is
+        exhausted ("…allowance is exhausted. Mint a new session token." — permanent for
+        that key, do not retry; mint a new token); (3) "This session token is not usable.
+        Mint a new one." — a SERVER-SIDE provisioning fault, not a client mistake: do NOT
+        re-mint in a loop (each mint is a metered request and the replacement will fail the
+        same way) — surface the error and contact partners@collectivex.health; (4) an
+        account-level restriction — contact partners@collectivex.health.
       headers:
         X-Request-Id:
           description: Request UUID.
@@ -1877,4 +2318,37 @@ components:
             error:
               code: not_found
               message: Job not found.
+              request_id: 550e8400-e29b-41d4-a716-446655440000
+
+    SessionTokenUnavailable:
+      description: |
+        503 Service Unavailable. A TRANSIENT upstream failure — either
+        while creating the key, or in the auth/rate-limit dependencies
+        every partner endpoint shares (the `error.message` names which).
+        Always carries `error.code: "internal_error"` and a `Retry-After`
+        header (jittered); retry with exponential backoff. A PERMANENT
+        deploy misconfiguration is reported as `500` (no Retry-After)
+        instead — see the 500 response on this operation. Unlike
+        `/v1/query` and `/v1/chat`, this endpoint never returns
+        `corpus_unavailable` — it doesn't touch the research corpus.
+      headers:
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+        Retry-After:
+          description: Seconds to wait before retrying. Always present on this response.
+          required: true
+          schema:
+            type: integer
+            example: 5
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: internal_error
+              message: Session token service temporarily unavailable. Please retry.
               request_id: 550e8400-e29b-41d4-a716-446655440000
