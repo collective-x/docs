@@ -73,8 +73,10 @@ populated instead.
 
 Default limits for the `standard` tier: **60 requests per minute**, **5000
 requests per day** — shared across every `/v1/*` endpoint that requires a
-key (`/v1/query`, `/v1/chat`, `/v1/jobs/{id}`, and `POST /v1/session-tokens`)
-per API key. Minting a session token is itself one metered request, and a
+key (`/v1/query`, `/v1/chat`, `POST /v1/jobs`, `/v1/jobs/{id}`, and
+`POST /v1/session-tokens`) per API key. Submitting an async job is one
+metered request and each poll is one more; the job's background execution is
+never metered. Minting a session token is itself one metered request, and a
 session key does not get its own budget — it draws from its parent
 long-lived key's pool, so the limit is effectively per partner.
 

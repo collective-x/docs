@@ -28,7 +28,8 @@
           {
             "group": "Features",
             "pages": [
-              "structured-answers"
+              "structured-answers",
+              "async-jobs"
             ]
           },
           {
