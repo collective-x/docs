@@ -1,0 +1,179 @@
+---
+title: "Async jobs"
+description: "Submit a /v1/query question as a background job with POST /v1/jobs and poll GET /v1/jobs/{id} for the answer."
+---
+
+Some callers can't hold an HTTP connection open for the 10–40 seconds a
+grounded answer takes — agent frameworks with a fixed tool timeout,
+serverless functions with a short ceiling, queue workers with a strict
+per-message budget. For them, `POST /v1/jobs` accepts **exactly the same
+request body as `POST /v1/query`**, answers `202 Accepted` with a job id in
+milliseconds, and produces the answer in the background. You poll
+`GET /v1/jobs/{id}` until the job is finished and read a `result` that is
+**byte-for-byte the `/v1/query` 200 body** you would have received
+synchronously. Same validation, same errors, same answer shape.
+
+## When to use it (and when not to)
+
+Use an async job when your caller cannot wait on the socket. If you *can*
+wait, use `POST /v1/query` — it is the same work, and the sync call is always
+at least as fast (a job never runs faster than a sync call; it just doesn't
+make you hold the connection). A job is also a bad fit if you need the answer
+in under ~10 seconds; nothing about the background path makes generation
+faster.
+
+## The loop: enqueue, poll with backoff, read
+
+<Steps>
+  <Step title="Enqueue">
+    `POST /v1/jobs` with your long-lived key and a `/v1/query` body. You get
+    `202` and a receipt:
+
+    ```json
+    {
+      "request_id": "550e8400-e29b-41d4-a716-446655440000",
+      "id": "8f14e45f-ceea-467e-adc0-7a1a6b5f6b28",
+      "job_type": "query",
+      "status": "queued",
+      "poll_url": "/v1/jobs/8f14e45f-ceea-467e-adc0-7a1a6b5f6b28",
+      "expires_at": "2026-09-11T13:00:00.000Z",
+      "created_at": "2026-09-11T12:00:00.000Z"
+    }
+    ```
+
+    `poll_url` is a path relative to the base URL you called. Keep
+    `request_id` — support can find both the submission and its background
+    run with it.
+  </Step>
+  <Step title="Poll with backoff, branching on the HTTP status">
+    Wait about a second, `GET` the poll URL, and keep going until `status` is
+    `succeeded`, `failed`, or `expired`. Back off between polls (start at 1 s,
+    multiply by 1.5, cap at 10 s). Handle each poll by its HTTP status:
+
+    - **`2xx`** — read `status` from the body and continue or stop accordingly.
+    - **`429` or `503`** — sleep `max(Retry-After, 1)` seconds and poll again.
+      Neither says anything about the job: a `429` is your rate budget, and a
+      `503` with `Retry-After` while polling is transient — **the job is
+      unaffected** and keeps running in the background.
+    - **Anything else** (`401`, `403`, `404`, `500`, …) — stop and inspect;
+      polling again will not change the answer. A `404` after `expires_at`
+      means the job is no longer retained — submit a new one.
+
+    `X-RateLimit-Remaining` is on every response — every poll is a metered
+    request against the same per-key budget as `/v1/query`. If it's getting
+    low, slow down; a tight polling loop is the easiest way to 429 yourself
+    out of your own answers.
+
+    A grounded answer typically lands in 10–40 seconds, so a sane loop makes
+    5–10 polls. **Concurrency budget:** at the default 60 requests/minute,
+    more than ~8 jobs in flight at once will 429 your polls — start each loop
+    from the `X-RateLimit-Remaining` value on the `202` and size your
+    concurrency from it (or ask for a higher per-key budget).
+  </Step>
+  <Step title="Read the result">
+    On `succeeded`, `result` is the `/v1/query` response: `answer`,
+    `citations`, optional `deferral` / `crisis` / `error`, and
+    `structured_answer` if you asked for `response_format: "structured"`.
+    Handle it exactly as you handle a sync response — including the deferral
+    case, where `answer` is empty and the corpus lacked strong evidence. On
+    `failed` or `expired`, branch on `error_code` (below) to decide whether
+    to resubmit.
+  </Step>
+</Steps>
+
+A minimal loop:
+
+```bash
+JOB=$(curl -sS -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"question":"What does the research say about magnesium for perimenopause sleep?"}')
+ID=$(echo "$JOB" | jq -r .id); SLEEP=1
+while :; do
+  sleep "$SLEEP"
+  RES=$(curl -sS -o /tmp/body -D /tmp/h -w '%{http_code}' "$BASE/v1/jobs/$ID" -H "Authorization: Bearer $KEY")
+  case "$RES" in
+    2*)
+      STATUS=$(jq -r .status /tmp/body)
+      case "$STATUS" in queued|running) SLEEP=$(awk "BEGIN{s=$SLEEP*1.5; print (s>10)?10:s}");; *) break;; esac ;;
+    429|503)
+      # Transient: rate budget, or a brief auth/rate-limit outage. The job is unaffected.
+      RA=$(grep -i '^retry-after' /tmp/h | tr -dc 0-9); SLEEP=$(( ${RA:-1} > 1 ? RA : 1 )) ;;
+    *)
+      echo "poll failed with HTTP $RES" >&2; cat /tmp/body >&2; exit 1 ;;
+  esac
+done
+jq . /tmp/body
+```
+
+## Statuses
+
+| `status` | Meaning | What to do |
+|---|---|---|
+| `queued` | Accepted; execution is about to start. | Keep polling. |
+| `running` | The pipeline is producing the answer. `started_at` is set, `attempts` is 1. | Keep polling. |
+| `succeeded` | Done. `result` is the `/v1/query` 200 body. | Read `result`. Terminal. |
+| `failed` | The pipeline could not produce anything usable. `error` is a short, display-safe message (the same texts `/v1/query` uses — safe to show, **not** to parse); `error_code` is the machine-readable reason. | **Branch on `error_code`:** `corpus_unavailable` or `internal` → transient, submit a new job with backoff. `generation_failed` → retrying the identical question usually yields the same outcome; rephrase or treat as unanswerable. `empty_query` → fix the request. `invalid_payload` → should never happen; contact support with the job id. Terminal. |
+| `expired` | The job did not finish before `expires_at`, **or** it was seen `running` for more than 2 minutes (the background run died — the answer is never coming). `error_code` is `expired`. | Submit a new job. Terminal. |
+
+Terminal states never change again. A job can go straight from `queued` to
+`expired` if it was never started in time.
+
+`error_code` is one of exactly six values — `generation_failed`,
+`corpus_unavailable`, `empty_query`, `invalid_payload`, `internal`,
+`expired` — and is `null` while the job is `queued`, `running`, or
+`succeeded`.
+
+## Expiry and retention
+
+Every job has an `expires_at`, one hour after submission. Three rules:
+
+- **Still `queued` or `running` at `expires_at`:** the **next read** marks it
+  `expired` and returns it once. You will never be shown a stale in-flight
+  status past the deadline.
+- **Seen `running` for more than 2 minutes:** treated as expired on the next
+  read, regardless of `expires_at`. The background run cannot outlive that
+  window, so a job still `running` after it has died (deploy, crash, timeout)
+  has no answer coming — you learn within minutes, not an hour.
+- **Already finished (`succeeded` / `failed` / `expired`):** readable **until
+  `expires_at`, and not after**. The first read past the deadline answers
+  `404 not_found`, and at that moment the stored request (`payload`) and
+  answer (`result`) are cleared. Rows are then deleted outright within about
+  24 hours of `expires_at`, whether or not anyone read them. Fetch your
+  result inside the hour.
+
+<Note>
+**Maximum retention horizon:** your question text and the generated answer
+exist on our side for at most `expires_at` + ~24 hours (≈ 25 hours after
+submission), and are unreadable through the API after `expires_at`.
+</Note>
+
+## Validation — the same rules as `/v1/query`, applied at submission
+
+Everything `/v1/query` rejects with `400`, `POST /v1/jobs` rejects with the
+same `400` **before** creating a job: unknown fields (including
+retrieval-tuning knobs), both or neither of `question`/`messages`, more than
+one message, a non-`user` role, a message with a `file` part, an empty or
+whitespace-only question (zero-width and other invisible characters count as
+blank). You will never wait on a job only to learn the request was
+malformed. One rule exists only here: because the body is stored and echoed
+back on every poll, it is capped at 32 KiB of JSON.
+
+## Keys and ownership
+
+Server-to-server only, with your long-lived partner key — both operations
+refuse session tokens with `403 forbidden`. A job belongs to your
+**partner**, not to the individual key that created it: any of your
+long-lived keys can poll any of your jobs. A job id that doesn't exist and a
+job id that belongs to another partner both return the identical
+`404 not_found`.
+
+## Metering
+
+Submitting a job is one metered request; each poll is one more. The
+background execution is never metered again. Budget accordingly: a job that
+takes 30 seconds and is polled sensibly costs roughly 6–8 requests of your
+per-minute budget, versus 1 for a sync call. See
+[Errors and rate limits](/errors-and-rate-limits) for the shared budget.
+
+Full request and response schemas (`JobResponse`, `error_code` values, and
+every status code) are in the API Reference tab under **Async jobs**.

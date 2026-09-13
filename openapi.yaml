@@ -22,6 +22,19 @@ openapi: 3.1.0
 
 info:
   title: CollectiveX Health Partner API
+  # 1.9 -> 1.10: additive minor bump for POST /v1/jobs (async jobs v1 — the
+  # `query` job type: an asynchronous POST /v1/query for callers that can't
+  # hold a 30s+ connection). Dark-launched behind PARTNER_JOBS_ENABLED (bare
+  # 404 off by default), documented ahead of the flip. Also extends
+  # JobResponse with three OPTIONAL fields — `attempts`, `started_at`, and
+  # the nullable `error_code` enum (the machine-readable failure class
+  # partners branch on) — deliberately NOT in `required`: new required
+  # response fields count as MAJOR under this repo's policy. `payload` /
+  # `result` are now typed (QueryRequest / QueryResponse) because `query` is
+  # the only job type that exists; a second job type would widen the oneOf.
+  # (#846 ownership re-anchor is behaviour, not shape.)
+  # 2026-09-13: flag flipped on in production — generally available. The
+  # 🚧 not-GA markers were removed (description-only edit, no bump).
   # 1.8 -> 1.9: additive minor bump for POST /v1/session-tokens
   # (session-tokens PR 2/3) — mint a short-lived, scoped Unkey key for a
   # partner's mobile client. Dark-launched behind
@@ -35,7 +48,7 @@ info:
   # the branch shipped both without touching this file at all). 1.6 itself
   # covers everything underneath this layer in the restacked chain
   # (#816, #820, #819 structured responses, #817 per-key rate budgets).
-  version: '1.9'
+  version: '1.10'
   description: |
     The CollectiveX Health Partner API gives your product access to a grounded,
     peer-reviewed women's-health research corpus. Every answer includes inline
@@ -44,9 +57,11 @@ info:
 
     There are two ways to use it: ask a single question and get one
     grounded answer (`/v1/query`), or have a back-and-forth conversation
-    with streaming or sync responses (`/v1/chat`), plus a status endpoint
-    for long-running jobs (`/v1/jobs/{id}` — no job types are live yet).
-    Pick whichever matches your integration below.
+    with streaming or sync responses (`/v1/chat`). A third, asynchronous
+    way — submit the same question as a job with `POST /v1/jobs` and poll
+    `GET /v1/jobs/{id}` for the answer — is for callers that can't hold
+    the connection open (see "Async jobs" below). Pick whichever matches
+    your integration.
 
     ---
 
@@ -381,9 +396,11 @@ info:
 
     Default limit for every key: **60 requests per minute**, shared across
     every `/v1/*` endpoint that requires a key — today that's `/v1/query`,
-    `/v1/chat`, `/v1/jobs/{id}`, and `POST /v1/session-tokens`. (A future
-    endpoint on this same key naturally
-    joins the same budget unless we say otherwise.)
+    `/v1/chat`, `POST /v1/jobs`, `/v1/jobs/{id}`, and
+    `POST /v1/session-tokens`. (A future endpoint on this same key naturally
+    joins the same budget unless we say otherwise.) Submitting an async job
+    is one metered request and each poll is one more; the job's background
+    execution is never metered.
 
     Two session-token consequences worth sizing for: **minting is itself a
     metered request** against your budget (one mint = one request), and a
@@ -492,9 +509,60 @@ tags:
     description: Multi-turn chat — streaming by default, or synchronous with stream:false.
   - name: Async jobs
     description: |
-      Poll the status of a longer-running job. Skeleton surface today —
-      only reading an existing job is exposed; nothing in this API creates
-      one yet (see the operation description below).
+      Ask a question without holding the connection open. `POST /v1/jobs`
+      accepts exactly the `/v1/query` request body, answers `202` with a job id in milliseconds, and runs
+      the same grounded-answer pipeline in the background; you poll
+      `GET /v1/jobs/{id}` until the job reaches a terminal state. Built
+      for agent pipelines and serverless callers whose own request timeout
+      is shorter than a grounded answer can take.
+
+      **Lifecycle.** `queued` → `running` → exactly one of `succeeded`
+      (read `result`), `failed` (read `error`), or `expired`. A job can
+      also go straight from `queued` to `expired` if it was never started
+      in time. Terminal states never change again.
+
+      **What you get back.** For a `query` job, `result` is byte-for-byte
+      the `200` body `POST /v1/query` would have returned for the same
+      request (`QueryResponse`) — same `answer`, `citations`, optional
+      `deferral` / `crisis` / `error`, and `structured_answer` when you
+      asked for `response_format: "structured"`. A request that
+      `/v1/query` would have answered with `502` (generation failed with
+      nothing usable) becomes a `failed` job whose `error` carries the
+      same generic message.
+
+      **Retention.** Every job carries an `expires_at` (one hour after
+      submission today). A job that is still `queued` or `running` when
+      that deadline passes is marked `expired` the next time it is read;
+      a job seen `running` for more than 2 minutes is likewise treated as
+      expired on the next read (the runner cannot live that long, so the
+      answer is never coming). A job that already finished keeps its
+      `result` readable **until `expires_at`** — the first read after
+      that returns `404 not_found`, its stored request and result are
+      cleared at that moment, and the row itself is deleted within
+      about 24 hours. Fetch your result before `expires_at`.
+
+      **Polling.** Start ~1 s after the `202`, then back off (e.g. ×1.5
+      up to 10 s). Every poll is a metered request against the same
+      per-key budget as `/v1/query`: honour `X-RateLimit-Remaining` and,
+      on a `429`, `Retry-After`. Branch on the HTTP status of each poll:
+      a `2xx` means read `status`; a `429` or a `503` means wait
+      `max(Retry-After, 1)` seconds and poll again — a `503` with
+      `Retry-After` while polling is transient (our auth/rate-limit
+      dependency was briefly unavailable) and the job itself is
+      unaffected; any other status means stop and inspect. A grounded
+      answer typically takes 10–40 s.
+
+      **Failures.** A `failed` (or `expired`) job carries a
+      machine-readable `error_code`; branch on it, not on the `error`
+      text: `corpus_unavailable` and `internal` are transient — submit
+      a new job with backoff; `generation_failed`, `empty_query`,
+      `invalid_payload` and `expired` mean the same request will fail
+      the same way.
+
+      **Who can call it.** Server-to-server only, with your long-lived
+      partner key — both operations refuse session tokens with
+      `403 forbidden`. Any of your long-lived keys can poll any of your
+      jobs (ownership is per partner, not per key).
   - name: Session tokens
     description: |
       Mint a short-lived, scoped key for a mobile client from your
@@ -988,6 +1056,171 @@ paths:
         '503':
           $ref: '#/components/responses/CorpusUnavailable'
 
+  /v1/jobs:
+    post:
+      operationId: postJob
+      summary: Submit a question as an async job (asynchronous /v1/query)
+      tags:
+        - Async jobs
+      description: |
+        Submit exactly the request body you would send to `POST /v1/query`
+        and get a job id back immediately, instead of waiting for the
+        grounded answer on an open connection. The answer is produced in
+        the background and read with `GET /v1/jobs/{id}` — see the "Async
+        jobs" tag description for the lifecycle, retention, and a polling
+        recipe.
+
+        **Validation is identical to `/v1/query`, and happens now.** The
+        body must contain exactly one of `question` or `messages` (one
+        user message), may set `response_format`, and may not contain
+        anything else. Every `400` this endpoint returns — unknown field,
+        both/neither shape, empty or whitespace-only question, a message
+        with a `file` part, a non-`user` role — is one `/v1/query` would
+        have returned for the same body. Nothing is accepted here only to
+        fail an hour of polling later. One extra rule applies only here:
+        the body is persisted and echoed back on every poll, so it is
+        capped at 32 KiB of JSON.
+
+        **What runs, and when.** On `202` the job is `queued` and starts
+        running immediately, in the background. It is the same
+        retrieval + safety + generation pipeline `/v1/query` uses, with the
+        same published tone and the same deferral/crisis behaviour — so
+        the eventual `result` is exactly the `QueryResponse` you would have
+        received synchronously. Expect the job to finish in the same
+        10–40 s a synchronous call takes; a job is never faster than the
+        sync call, it just doesn't make you wait on the socket.
+
+        **Metering.** Submitting is one metered request against your
+        per-key budget (the same pool as `/v1/query`, `/v1/chat`, and
+        polling). The background execution is not metered again.
+
+        **Server-to-server only, with your long-lived key.** A session
+        token gets `403 forbidden` here, exactly as on `GET /v1/jobs/{id}`.
+        Never embed your long-lived key in a client.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+            examples:
+              question:
+                summary: Plain question (recommended)
+                value:
+                  question: What does the research say about magnesium for perimenopause sleep?
+              structured:
+                summary: Same question, structured result
+                value:
+                  question: What does the research say about magnesium for perimenopause sleep?
+                  response_format: structured
+      responses:
+        '202':
+          description: |
+            Accepted. The job exists and is running in the background. Poll
+            `poll_url` (a path relative to the API base URL you called)
+            until `status` is terminal. Nothing about the answer is known
+            yet — this response deliberately carries no `result`.
+          headers:
+            X-Request-Id:
+              description: UUID correlation key for this request. Also stamped on the job's background execution, so quoting it to support finds both.
+              required: true
+              schema:
+                type: string
+                format: uuid
+                example: 550e8400-e29b-41d4-a716-446655440000
+            X-RateLimit-Limit:
+              description: Maximum requests per minute for this key (shared budget with /v1/query, /v1/chat, /v1/jobs/{id}, and /v1/session-tokens; per-key configurable, default 60).
+              required: true
+              schema:
+                type: integer
+                example: 60
+            X-RateLimit-Remaining:
+              description: Requests remaining in the current per-minute rate-limit window.
+              required: true
+              schema:
+                type: integer
+                example: 59
+            X-RateLimit-Reset:
+              description: Unix timestamp (seconds) when the per-minute rate-limit window resets.
+              required: true
+              schema:
+                type: integer
+                example: 1717000060
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobAcceptedResponse'
+              example:
+                request_id: 550e8400-e29b-41d4-a716-446655440000
+                id: 8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
+                job_type: query
+                status: queued
+                poll_url: /v1/jobs/8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
+                expires_at: '2026-09-11T13:00:00.000Z'
+                created_at: '2026-09-11T12:00:00.000Z'
+        '400':
+          description: |
+            400 Bad Request. The body failed the `/v1/query` request rules
+            (the message names the problem — same texts as `/v1/query`), or
+            exceeds the 32 KiB async-job body cap. Fix the request; nothing
+            was created.
+          headers:
+            X-Request-Id:
+              description: Request UUID.
+              schema:
+                type: string
+                format: uuid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                empty_question:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: Latest user message must not be empty.
+                      request_id: 550e8400-e29b-41d4-a716-446655440000
+                unknown_field:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: 'Unknown field: topK. The /v1/query endpoint does not accept retrieval tuning parameters.'
+                      request_id: 550e8400-e29b-41d4-a716-446655440000
+                too_large:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: Request body too large for an async job (limit 32768 bytes of JSON).
+                      request_id: 550e8400-e29b-41d4-a716-446655440000
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: |
+            404 Not Found — **endpoint switched off**. Not expected in
+            normal operation: you only see it if the operator kill switch
+            for async jobs has been turned off, in which case every caller
+            receives this bare response: status 404, body `{}`, no error
+            envelope and no `X-Request-Id` — indistinguishable from an
+            unknown route by design. There is nothing to retry; contact
+            partners@collectivex.health.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+              example: {}
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/JobSubmitUnavailable'
+
   /v1/jobs/{id}:
     get:
       operationId: getJob
@@ -995,13 +1228,23 @@ paths:
       tags:
         - Async jobs
       description: |
-        Read-only poll for one async job's current state. This is a
-        **skeleton surface**: nothing in this API creates a job yet —
-        there is no `POST /v1/jobs`. Job rows are written by internal
-        processes today; job types ship one at a time, each behind its
-        own validated shape, in a later release. This endpoint exists so
-        that work can land ahead of the first job type without a
-        breaking spec change later.
+        Read-only poll for one async job's current state. Jobs are
+        created by `POST /v1/jobs` — see the "Async jobs" tag for the
+        lifecycle, retention, and polling guidance.
+
+        **Reading past the deadline.** If the job is still `queued` or
+        `running` when its `expires_at` has passed — or it has been
+        `running` for more than 2 minutes — this read marks it `expired`
+        before returning it, so you never see a stale in-flight state.
+        A job that had already finished (`succeeded` / `failed` /
+        `expired`) is returned as it finished **until `expires_at`**;
+        the first read after that answers `404 not_found`, clears the
+        stored request and result, and the row is deleted within ~24 h.
+        Fetch your result before `expires_at`.
+
+        **Transient errors while polling.** A `429`, or a `503` that
+        carries `Retry-After`, says nothing about the job: wait
+        `max(Retry-After, 1)` seconds and poll again.
 
         **Server-to-server only, with your long-lived key.** A short-lived
         session token (see "Mobile-direct access" above) cannot call this
@@ -1010,10 +1253,11 @@ paths:
         every other endpoint. Do NOT call this endpoint from browser-side
         code, and never embed your long-lived key in any client.
 
-        Scoping: a job is visible only to the API key that owns it. A
-        job id that doesn't exist and a job id that belongs to a
-        different key both return the identical `404 not_found` — this
-        endpoint never confirms another partner's job id exists.
+        Scoping: a job is visible to every long-lived key of the partner
+        that created it (ownership is per partner, not per key). A job id
+        that doesn't exist and a job id that belongs to a different
+        partner both return the identical `404 not_found` — this endpoint
+        never confirms another partner's job id exists.
 
         Rate limits are communicated via `X-RateLimit-*` headers on every
         response and are shared with `/v1/query` and `/v1/chat` per API
@@ -1042,7 +1286,7 @@ paths:
                 format: uuid
                 example: 550e8400-e29b-41d4-a716-446655440000
             X-RateLimit-Limit:
-              description: Maximum requests per minute for this key (shared budget with /v1/query, /v1/chat, and /v1/session-tokens; per-key configurable, default 60).
+              description: Maximum requests per minute for this key (shared budget with /v1/query, /v1/chat, POST /v1/jobs, and /v1/session-tokens; per-key configurable, default 60).
               required: true
               schema:
                 type: integer
@@ -1065,33 +1309,83 @@ paths:
                 $ref: '#/components/schemas/JobResponse'
               examples:
                 succeeded_job:
-                  summary: Completed job
+                  summary: Completed query job — `result` is the /v1/query 200 body
                   value:
                     request_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
                     id: 8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
-                    job_type: lab_panel_interpretation
+                    job_type: query
                     status: succeeded
                     payload:
-                      panelId: p1
+                      question: What does the research say about magnesium for perimenopause sleep?
                     result:
-                      score: 1
+                      request_id: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                      answer: 'Several trials suggest magnesium may modestly improve sleep quality… [1]'
+                      citations:
+                        - id: chunk_abc123
+                          score: 0.87
+                          text: 'Magnesium supplementation improved subjective sleep quality…'
+                          metadata:
+                            title: Magnesium and sleep in midlife women
+                            doi: 10.1000/example.doi
+                            year: '2023'
                     error: null
-                    expires_at: null
-                    created_at: '2026-08-19T00:00:00.000Z'
-                    updated_at: '2026-08-19T00:05:00.000Z'
+                    error_code: null
+                    expires_at: '2026-09-11T13:00:00.000Z'
+                    attempts: 1
+                    started_at: '2026-09-11T12:00:00.400Z'
+                    created_at: '2026-09-11T12:00:00.000Z'
+                    updated_at: '2026-09-11T12:00:23.000Z'
                 running_job:
                   summary: Still in progress
                   value:
                     request_id: b2c3d4e5-f6a7-8901-bcde-f12345678901
                     id: 8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
-                    job_type: lab_panel_interpretation
+                    job_type: query
                     status: running
-                    payload: {}
+                    payload:
+                      question: What does the research say about magnesium for perimenopause sleep?
                     result: null
                     error: null
-                    expires_at: null
-                    created_at: '2026-08-19T00:00:00.000Z'
-                    updated_at: '2026-08-19T00:00:01.000Z'
+                    error_code: null
+                    expires_at: '2026-09-11T13:00:00.000Z'
+                    attempts: 1
+                    started_at: '2026-09-11T12:00:00.400Z'
+                    created_at: '2026-09-11T12:00:00.000Z'
+                    updated_at: '2026-09-11T12:00:00.400Z'
+                failed_job:
+                  summary: Failed — branch on `error_code`; `error` is a display-safe message
+                  value:
+                    request_id: c3d4e5f6-a7b8-9012-cdef-123456789012
+                    id: 8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
+                    job_type: query
+                    status: failed
+                    payload:
+                      question: What does the research say about magnesium for perimenopause sleep?
+                    result: null
+                    error: Generation failed. Please retry.
+                    error_code: generation_failed
+                    expires_at: '2026-09-11T13:00:00.000Z'
+                    attempts: 1
+                    started_at: '2026-09-11T12:00:00.400Z'
+                    created_at: '2026-09-11T12:00:00.000Z'
+                    updated_at: '2026-09-11T12:00:31.000Z'
+                expired_job:
+                  summary: Expired — seen `running` for over 2 minutes (the invocation died); resubmit
+                  value:
+                    request_id: d4e5f6a7-b8c9-0123-def1-234567890123
+                    id: 8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
+                    job_type: query
+                    status: expired
+                    payload:
+                      question: What does the research say about magnesium for perimenopause sleep?
+                    result: null
+                    error: null
+                    error_code: expired
+                    expires_at: '2026-09-11T13:00:00.000Z'
+                    attempts: 1
+                    started_at: '2026-09-11T12:00:00.400Z'
+                    created_at: '2026-09-11T12:00:00.000Z'
+                    updated_at: '2026-09-11T12:02:10.000Z'
         '400':
           description: |
             400 Bad Request. `id` is not a valid UUID. `partner_jobs.id`
@@ -1903,9 +2197,14 @@ components:
     JobResponse:
       type: object
       description: |
-        Current state of one async job. `payload` and `result` are opaque
-        JSON — their shape is defined per `job_type`, not by this
-        envelope (see the `job_type` field description).
+        Current state of one async job. `payload` is the request the job
+        was created with and `result` is its output; both are typed per
+        `job_type`. The only job type today is `query`, whose `payload` is
+        a `QueryRequest` and whose `result` is a `QueryResponse`.
+      # `attempts`, `started_at` and `error_code` are additive (1.10) and
+      # deliberately NOT required — a new required response field is a
+      # MAJOR bump under this repo's versioning policy. They are always
+      # present on the wire today.
       required:
         - request_id
         - id
@@ -1929,11 +2228,12 @@ components:
         job_type:
           type: string
           description: |
-            Identifies what kind of work this job represents (e.g.
-            "lab_panel_interpretation") and therefore the shape of
-            `payload`/`result`. Not an enum in this spec — new job types
-            ship without a spec change; consult the job type's own
-            documentation for its payload/result shape.
+            Identifies what kind of work this job represents and therefore
+            the shape of `payload`/`result`. Today always `query` (an
+            asynchronous `/v1/query`). Not an enum in this spec — a future
+            job type would be an additive minor bump, with its own
+            payload/result shape documented alongside.
+          example: query
         status:
           type: string
           enum:
@@ -1945,25 +2245,108 @@ components:
           description: |
             Current lifecycle state. `queued` → `running` → one of
             `succeeded` / `failed` / `expired` (terminal); `queued` can
-            also go directly to `expired` if never claimed in time.
+            also go directly to `expired` if never started in time. A read
+            never shows a stale in-flight state: a job past `expires_at`,
+            or one seen `running` for more than 2 minutes (the background
+            run cannot live that long — it died), is moved to `expired`
+            by the read itself. `expired` carries `error_code: "expired"`.
         payload:
-          description: The job's input, as it was created with. Shape depends on `job_type`.
+          description: |
+            The job's input, exactly as it was created with (after
+            validation — unknown fields were rejected at submission). For
+            `job_type: "query"` this is the `QueryRequest` you sent.
+          oneOf:
+            - $ref: '#/components/schemas/QueryRequest'
         result:
-          description: The job's output. `null` until `status` is `succeeded`. Shape depends on `job_type`.
+          description: |
+            The job's output. `null` until `status` is `succeeded`. For
+            `job_type: "query"` this is byte-for-byte the `200` body
+            `POST /v1/query` would have returned for the same request —
+            including `structured_answer` when `response_format:
+            "structured"` was requested, and the optional `deferral` /
+            `crisis` / `error` fields with the same meaning. A request
+            `/v1/query` would have answered `502` becomes a `failed` job
+            instead (see `error`).
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/QueryResponse'
         error:
           description: |
             Generic human-readable failure message, present when `status`
-            is `failed`. Safe to display; do not parse. This is enforced
-            at the write boundary (`lib/jobs/store.ts`'s `failJob`), not
-            merely promised: a failure message is rejected before it is
-            ever stored unless it is non-empty, at most 500 characters,
-            and contains no URL.
+            is `failed`. Safe to display; **do not parse — branch on
+            `error_code`**. The messages are the same texts `/v1/query`
+            uses on its own error paths ("Generation failed. Please
+            retry.", "Research corpus temporarily unavailable. Please
+            retry.", …) — never an internal error, never your input echoed
+            back. This is enforced at the write boundary
+            (`lib/jobs/store.ts`'s `failJob`), not merely promised: a
+            message that is empty, over 500 characters, or looks like it
+            could carry an internal detail is replaced with a generic one
+            before it is stored.
           oneOf:
             - type: 'null'
             - type: string
               maxLength: 500
+        error_code:
+          description: |
+            Machine-readable failure class — the field to branch on. Set
+            whenever `status` is `failed` or `expired`; `null` otherwise.
+            Bounded enum (also enforced by a database CHECK):
+
+            - `corpus_unavailable` — the research corpus was unreachable
+              during execution. **Transient: submit a new job with
+              backoff.** (At submission time the same outage never occurs —
+              the corpus is not touched until the job runs.)
+            - `internal` — an unexpected server-side error. **Transient:
+              submit a new job with backoff**; if it repeats, contact
+              support with the job id.
+            - `generation_failed` — the pipeline ran but produced nothing
+              usable (the sync route's `502`). Not transient in the retry
+              sense: retrying the identical question usually yields the
+              same outcome; rephrase or treat as unanswerable.
+            - `empty_query` — the question was blank once normalised.
+              Fix the request.
+            - `invalid_payload` — the stored request no longer passes
+              validation. Should never occur; contact support.
+            - `expired` — the job hit its deadline or was seen `running`
+              for more than 2 minutes without finishing. Submit a new job.
+          oneOf:
+            - type: 'null'
+            - type: string
+              enum:
+                - generation_failed
+                - corpus_unavailable
+                - empty_query
+                - invalid_payload
+                - internal
+                - expired
         expires_at:
-          description: When this job stops being considered valid, if a deadline was set. `null` means no deadline.
+          description: |
+            When this job and its result stop being readable. Set on every
+            job created through `POST /v1/jobs` (one hour after
+            submission). A job still `queued`/`running` at this instant is
+            expired on the next read. A job that already finished is
+            readable until this instant and **not after**: the first read
+            past `expires_at` returns `404 not_found` and clears the stored
+            `payload` and `result`; the row is deleted within about 24
+            hours. Fetch your result before then. `null` only for jobs
+            created without a deadline (none today) — such a job is never
+            expired or cleared by the read path.
+          oneOf:
+            - type: 'null'
+            - type: string
+              format: date-time
+        attempts:
+          type: integer
+          minimum: 0
+          description: |
+            How many times execution of this job was started. `0` while
+            `queued`; `1` once it is `running` or terminal. The current
+            runner never retries, so a value above `1` is not expected —
+            the field exists so that a future retrying runner needs no
+            contract change.
+        started_at:
+          description: When execution last started. `null` while `queued`.
           oneOf:
             - type: 'null'
             - type: string
@@ -1976,6 +2359,53 @@ components:
           type: string
           format: date-time
           description: When the job's status/result last changed.
+
+    JobAcceptedResponse:
+      type: object
+      description: |
+        `202` body from `POST /v1/jobs`. A receipt, not a result: it tells
+        you where to poll and how long the job will be readable.
+      required:
+        - request_id
+        - id
+        - job_type
+        - status
+        - poll_url
+        - expires_at
+        - created_at
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          description: UUID minted for this submission. The job's background execution reuses it for tracing, so quote it to support.
+        id:
+          type: string
+          format: uuid
+          description: The job's id. Use it with `GET /v1/jobs/{id}`.
+        job_type:
+          type: string
+          description: Always `query` today — see `JobResponse.job_type`.
+          example: query
+        status:
+          type: string
+          enum:
+            - queued
+          description: Always `queued` on the 202 — execution begins in the background immediately after this response is sent.
+        poll_url:
+          type: string
+          description: |
+            Path to poll, relative to the API base URL you called (e.g.
+            `/v1/jobs/8f14e45f-…`). Deliberately not an absolute URL: the
+            host you called is the host to poll.
+          example: /v1/jobs/8f14e45f-ceea-467e-adc0-7a1a6b5f6b28
+        expires_at:
+          type: string
+          format: date-time
+          description: When the job and its result stop being readable — one hour after submission. Fetch your result before then.
+        created_at:
+          type: string
+          format: date-time
+          description: When the job was created.
 
     SessionTokenRequest:
       type: object
@@ -2294,10 +2724,41 @@ components:
 
     JobNotFound:
       description: |
-        404 Not Found. Either no job exists with this id, or it belongs
-        to a different API key — the two cases are indistinguishable by
-        design (`GET /v1/jobs/{id}` never confirms another partner's job
-        id exists).
+        404 Not Found. One of three cases, indistinguishable by design
+        (`GET /v1/jobs/{id}` never confirms another partner's job id
+        exists): no job exists with this id; the job belongs to a
+        different partner identity (ownership is per partner, not per
+        key — any of your long-lived keys sees your jobs); or the job
+        has passed its `expires_at` and is no longer retained. There is
+        nothing to retry — submit a new job if you still need the answer.
+      headers:
+        X-Request-Id:
+          description: Request UUID.
+          schema:
+            type: string
+            format: uuid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: not_found
+              message: Job not found.
+              request_id: 550e8400-e29b-41d4-a716-446655440000
+
+    JobSubmitUnavailable:
+      description: |
+        503 Service Unavailable. A TRANSIENT failure in the auth/rate-limit
+        dependency every partner endpoint shares (Unkey), so the job could
+        not be accepted. Always carries `error.code: "internal_error"` and
+        a `Retry-After` header (jittered); retry the submission with
+        exponential backoff — nothing was created. Unlike `/v1/query`,
+        this endpoint never returns `corpus_unavailable` at submission:
+        the research corpus is not touched until the job runs in the
+        background, and a corpus outage during execution surfaces as a
+        `failed` job with `error_code: "corpus_unavailable"` on
+        `GET /v1/jobs/{id}`, not as a 503 here.
       headers:
         X-Request-Id:
           description: Request UUID.
@@ -2305,8 +2766,8 @@ components:
             type: string
             format: uuid
         Retry-After:
-          description: Seconds to wait before retrying. Present on the `internal_error` (Unkey-outage) variant; absent on `corpus_unavailable`.
-          required: false
+          description: Seconds to wait before retrying. Always present on this response.
+          required: true
           schema:
             type: integer
             example: 5
@@ -2316,8 +2777,8 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
           example:
             error:
-              code: not_found
-              message: Job not found.
+              code: internal_error
+              message: Rate limit service temporarily unavailable. Please retry.
               request_id: 550e8400-e29b-41d4-a716-446655440000
 
     SessionTokenUnavailable:
